@@ -27,4 +27,4 @@ echo "Checking GPU status with nvidia-smi"
 nvidia-smi  # This will show the GPU status assigned to your job
 
 echo "--- Running python script dnn_weight_noise.py ---"
-python -u dnn_weight_noise.py --experiment-version v22 --experiment-type cnn --cloud-environment hpc --debug-mode experiment
+python -u dnn_weight_noise.py --experiment-version v21 --experiment-type cnn --cloud-environment hpc --debug-mode experiment

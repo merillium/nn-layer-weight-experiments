@@ -759,9 +759,17 @@ class DnnLayerWeightExperiment():
         
         ## a preloaded CNN model has a different architecture
         else:
-            noise_vars = [0.1, 0.4, 0.7, 1.0, 1.4, 1.7, 2.0]
+            # get standard deviation corresponding to the largest layer
+            
+            # noise_stds = np.linspace(0, self.max_weights_std, 6)
 
+            noise_stds = np.linspace(0, 0.08, 6)
+            noise_vars = noise_stds**2
+            # noise_vars = [0.1, 0.4, 0.7, 1.0, 1.4, 1.7, 2.0]
+
+            ## store the noise vars to be plotted (true noise vars may be scaled)
             self.all_layer_noise_test_acc["noise_vars"] = noise_vars
+            
             all_feature_layers = [layer for layer in self.model.state_dict() if "feature" in layer]
             count_dict = {int(layer.split('.')[1]): 0 for layer in all_feature_layers}
             for layer in all_feature_layers:
@@ -818,9 +826,10 @@ class DnnLayerWeightExperiment():
                             true_noise_var =  noise_var / layer_width
                         
                         if self.preloaded:
-                            layer_width = size[0]
+                            # layer_width = size[0]
                             # print(f"layer_width = {layer_width}")
-                            true_noise_var = noise_var / layer_width
+                            # true_noise_var = noise_var / layer_width
+                            true_noise_var = noise_var
 
                         noise = torch.normal(mean=0, std=np.sqrt(true_noise_var), size=size).to(device)
                         new_experiment.model.state_dict()[layer_string].data += noise
@@ -849,18 +858,24 @@ class DnnLayerWeightExperiment():
         
         fig_noise_vs_accuracy = go.Figure()
         for layer_col in list(layer_cols):
+            text_x = df_accuracy_vs_noise['noise_vars'].iloc[-1]
+            text_y = df_accuracy_vs_noise[layer_col].iloc[-1]
+            print(f"{layer_col}: {text_x}, {text_y}")
+            fig_noise_vs_accuracy.add_annotation(
+                xref="x",yref="y",
+                x=text_x*1.05, y=text_y, showarrow=False,
+                text=layer_col,
+            )
             fig_noise_vs_accuracy.add_trace(
                 go.Scatter(
                     x=df_accuracy_vs_noise['noise_vars'],
                     y=df_accuracy_vs_noise[layer_col],
-                    text=[layer_col],
-                    textposition='top left',
-                    mode='lines+markers+text',
+                    mode='lines+markers',
                     marker=dict(color=self._layer_color_map[layer_col]),
                     name=layer_col,
                 )
             )
-
+        
         fig_noise_vs_accuracy.update_traces(mode='lines+markers', opacity=0.8) 
         
         if self.preloaded:
@@ -872,7 +887,8 @@ class DnnLayerWeightExperiment():
         else:
             title = f"""DNN with {self.model._N_LAYERS} layers + layer widths of {self.model._HIDDEN_LAYER_WIDTHS} with training accuracy = {self.train_accuracy:.2%}
                             <br>Noise vs Test Accuracy by layer ({self.dataset_name}, seed = {self.noise_random_seed})"""
-        fig_noise_vs_accuracy.update_layout(title=title)
+        
+        fig_noise_vs_accuracy.update_layout(title=title, xaxis_title='noise vars (unscaled)', height=1200)
         self.all_figures['noise_test_accuracies'] = fig_noise_vs_accuracy
 
 def run_dnn_experiments(dnn_experiments, N_EPOCHS, directory, noise_random_seed, MAX_TRAIN_ATTEMPTS=5, regularizer=None, debug=True):
@@ -1021,18 +1037,18 @@ if __name__ == "__main__":
         print("----- Running CNN experiments with pretrained VGG models -----")
 
         if debug:
-            cnn_model = torch.hub.load("chenyaofo/pytorch-cifar-models",f"cifar10_vgg16_bn", pretrained=True).to(device)
+            cnn_model = torch.hub.load("chenyaofo/pytorch-cifar-models",f"cifar10_vgg11_bn", pretrained=True).to(device)
             print(cnn_model)
             random_seed = 42
             cnn_experiment = DnnLayerWeightExperiment(model=cnn_model, dataset_name='cifar10', preloaded=True, noise_random_seed=random_seed)
             cnn_experiment.load_dataset()
             cnn_experiment.create_layer_weight_plots()
-            cnn_experiment.all_figures['fig_histogram'].write_html(f"{directory}/vgg16_final_layer_weights.html")
+            cnn_experiment.all_figures['fig_histogram'].write_html(f"{directory}/vgg11_final_layer_weights.html")
 
-            cnn_experiment.create_models_with_noise(N_NOISE_SAMPLES=5)
+            cnn_experiment.create_models_with_noise(N_NOISE_SAMPLES=3)
             cnn_experiment.create_accuracy_vs_noise_plots()
 
-            file_path = f"{directory}/vgg16_init_noise_experiments.html"
+            file_path = f"{directory}/vgg11_init_noise_experiments.html"
             cnn_experiment.all_figures['noise_test_accuracies'].write_html(file_path)
         else:
             for vgg_model in ["vgg11","vgg13","vgg16"]:
