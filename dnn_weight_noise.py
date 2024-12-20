@@ -25,9 +25,9 @@ from utils import fit_gaussian_curve, init_weights, equalize_axes_layout
 # from cifar10_models.vgg import vgg11_bn, vgg13_bn, vgg16_bn, vgg19_bn
 
 ## torch info
-print(torch.__version__)
-print(torch.cuda.is_available())
-print(torch.cuda.device_count())
+# print(torch.__version__)
+# print(torch.cuda.is_available())
+# print(torch.cuda.device_count())
 
 # from torchvision.models import vgg16
 
@@ -240,8 +240,14 @@ class DnnLayerWeightExperiment():
         ## try learning rates [0.0001, 0.001, 0.01]
         ## maybe scale up later if needed for more experiments
         ## learning rates for adam?
-        lr_adam = [3*10**-4, 5*10**-4, 10**-3]
+        # lr_adam = [3*10**-4, 5*10**-4, 10**-3]
         lr_sgd = [0.0001, 0.001, 0.01]
+
+        lr_decay_factor = 0.5
+
+        ## detect a plateau (e.g. an average change of < 0.01 over a period of 20 epochs)
+        plateau_threshold = 0.01
+        plateau_epochs = 20
         
         for lr in lr_sgd:
 
@@ -250,8 +256,8 @@ class DnnLayerWeightExperiment():
             optimizer = optim.SGD(self.model.parameters(), lr=lr, momentum=0.9, weight_decay=l2_lambda, nesterov=True)
 
             ## optimizer = optim.Adam(self.model.parameters(), lr=lr, betas=(0.9,0.999), weight_decay=l2_lambda)
+            # scheduler = ExponentialLR(optimizer, gamma=0.9)
 
-            scheduler = ExponentialLR(optimizer, gamma=0.9)
             for epoch in range(N_EPOCHS):
 
                 loss = 0.0
@@ -319,6 +325,14 @@ class DnnLayerWeightExperiment():
                 ## calculate test accuracy for the epoch
                 test_accuracy = self.get_test_accuracy()
                 test_accuracies.append(test_accuracy)
+
+                ## if plateauing is occurring, we need to change the learning rate
+                if epoch % plateau_epochs == 0:
+                    avg_epoch_change = np.mean(np.diff(np.array(test_accuracies[-plateau_epochs:])))
+                    if avg_epoch_change < plateau_threshold:
+                        lr = lr * lr_decay_factor
+                        print(f"test accuracy has plateaued at epoch {epoch}, new learning rate = {lr}")
+                        optimizer = optim.SGD(self.model.parameters(), lr=lr, momentum=0.9, weight_decay=l2_lambda, nesterov=True)
 
             ## model training is completed for some learning rate, lr
             ## check if the accuracy is above a certain threshold AND better than previous accuracy
@@ -656,6 +670,9 @@ class DnnLayerWeightExperiment():
         ################################################ 
         # FOR PRELOADED MODEL, ONLY PLOT FINAL WEIGHTS 
         ################################################
+
+        # print('layer names:')
+        # print([layer for layer in self.model.state_dict()])
         
         if self.preloaded:
             all_feature_layers = [layer for layer in self.model.state_dict() if "feature" in layer]
@@ -682,17 +699,24 @@ class DnnLayerWeightExperiment():
                 row = (i // 2) + 1
                 col = (i % 2) + 1
 
-                layer_string = f"features.{n_stack}.weight"
-                layer_weights = self.model.state_dict()[layer_string].data.detach().cpu().numpy()
+                weight_weight_layer_string = f"features.{n_stack}.weight"
+                layer_weights = self.model.state_dict()[weight_weight_layer_string].data.detach().cpu().numpy()
+
+                # batchnorm_weight_layer_string = f"features.{n_stack}.BatchNorm2d"
+                # batch_norm_weights = self.model.state_dict()[weight_weight_layer_string].data.detach().cpu().numpy()
+                # print(f"batch_norm_weights have shape: {batch_norm_weights.shape}")
                 
                 ## setting color scheme for each layer
                 self._layer_color_map[f"layer_{n_stack+1}"] = self._color_palette[i-1]
 
-                print(f"layer {layer_string} has shape {layer_weights.shape}")     
-
                 weights_flat = layer_weights.reshape(-1)
                 weights_mean = np.mean(weights_flat)
                 weights_std = np.std(weights_flat)
+
+                unscaled_noise_var = weights_std**2 * len(weights_flat)
+                print(f"layer {weight_weight_layer_string} has total variance = {unscaled_noise_var}")
+
+                ## print(f"layer {weight_layer_string} has shape {layer_weights.shape} with {len(weights_flat)} scalar weights")   
 
                 ## track the maximum standard deviation of weights
                 if self.max_weights_std is None:
@@ -752,7 +776,7 @@ class DnnLayerWeightExperiment():
         #     ...
         
         if not self.preloaded:
-            noise_vars = [0.1, 0.4, 0.7, 1.0, 1.4, 1.7, 2.0]
+            noise_vars = [0.1, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
             self.all_layer_noise_test_acc["noise_vars"] = noise_vars
             n_stack_layers = [int(''.join(filter(str.isdigit, layer))) for layer in self.model.state_dict() if (("weight" in layer) and ("classifier" not in layer))]
             print(n_stack_layers)
@@ -783,13 +807,13 @@ class DnnLayerWeightExperiment():
             print(n_stack_layers)
 
             for i, n_stack in enumerate(n_stack_layers):
-                layer_string = f"features.{n_stack}.weight"
-                layer_weights = self.model.state_dict()[layer_string].data.detach().cpu().numpy()
+                weight_layer_string = f"features.{n_stack}.weight"
+                layer_weights = self.model.state_dict()[weight_layer_string].data.detach().cpu().numpy()
                 
                 ## setting color scheme for each layer
                 self._layer_color_map[f"layer_{n_stack+1}"] = self._color_palette[i-1]
 
-                print(f"layer {layer_string} as shape {layer_weights.shape}")
+                print(f"layer {weight_layer_string} as shape {layer_weights.shape}")
 
         for n_stack in n_stack_layers:
             ## for a particular layer (n_stack), keep track of the test_accuracy vs noise
@@ -807,13 +831,16 @@ class DnnLayerWeightExperiment():
                     ## find the layer, add noise
                     with torch.no_grad():
                         if not self.preloaded:
-                            layer_string = f"linear_relu_stack.{n_stack}.weight"
+                            weight_layer_string = f"linear_relu_stack.{n_stack}.weight"
+                            bias_layer_string = f"linear_relu_stack.{n_stack}.bias"
                         else:
-                            layer_string = f"features.{n_stack}.weight"
+                            weight_layer_string = f"features.{n_stack}.weight"
+                            bias_layer_string = f"features.{n_stack}.bias"
                         
-                        print(f"adding noise to {layer_string} weights")
+                        print(f"adding noise to {weight_layer_string} weights")
 
-                        size = new_experiment.model.state_dict()[layer_string].data.shape
+                        weight_layer_size = new_experiment.model.state_dict()[weight_layer_string].data.shape
+                        bias_layer_size = new_experiment.model.state_dict()[bias_layer_string].data.shape
                         # print(f"size = {size}")
 
                         ## get width of previous layer
@@ -831,18 +858,25 @@ class DnnLayerWeightExperiment():
                             # true_noise_var = noise_var / layer_width
                             true_noise_var = noise_var
 
-                        noise = torch.normal(mean=0, std=np.sqrt(true_noise_var), size=size).to(device)
-                        new_experiment.model.state_dict()[layer_string].data += noise
+                        weight_noise = torch.normal(mean=0, std=np.sqrt(true_noise_var), size=weight_layer_size).to(device)
+                        bias_noise = torch.normal(mean=0, std=np.sqrt(true_noise_var), size=bias_layer_size).to(device)
+
+                        ## add noise to both (bias) and weight layers
+                        ## bias_layer_string = f"features.{n_stack}.bias"
+
+                        new_experiment.model.state_dict()[weight_layer_string].data += weight_noise
+                        new_experiment.model.state_dict()[bias_layer_string].data += bias_noise
+                        
 
                     ## after noise has been added to a layer, get the accuracy
                     test_acc = new_experiment.get_test_accuracy()
-                    print(f"test accuracy for {layer_string} = {test_acc:.2%}")
+                    print(f"test accuracy for {weight_layer_string} = {test_acc:.2%}")
 
                     test_acc_sum += test_acc
 
                 avg_test_acc = test_acc_sum/N_NOISE_SAMPLES
                 layer_avg_test_accs.append(avg_test_acc)
-                print(f"Average test accuracy for {layer_string} with N = {N_NOISE_SAMPLES} samples of noise at vars = {noise_var}: {avg_test_acc:.2%}")
+                print(f"Average test accuracy for {weight_layer_string} with N = {N_NOISE_SAMPLES} samples of noise at vars = {noise_var}: {avg_test_acc:.2%}")
             
             # layer_number = (2 + int((n_stack-1)/2)) if n_stack != 0 else 1
             # print(f'setting layer_{layer_number}')
