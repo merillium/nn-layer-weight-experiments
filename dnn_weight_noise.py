@@ -9,8 +9,8 @@ import re
 import torch
 from torch import nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import ExponentialLR
-from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import ExponentialLR, ReduceLROnPlateau
+from torch.utils.data import DataLoader, random_split
 from torchvision import datasets, transforms
 
 from plotly.subplots import make_subplots
@@ -19,15 +19,12 @@ import plotly.express as px
 
 from utils import fit_gaussian_curve, init_weights, equalize_axes_layout
 
-# import detectors
-# import timm
-
 # from cifar10_models.vgg import vgg11_bn, vgg13_bn, vgg16_bn, vgg19_bn
 
 ## torch info
-# print(torch.__version__)
-# print(torch.cuda.is_available())
-# print(torch.cuda.device_count())
+print(torch.__version__)
+print(torch.cuda.is_available())
+print(torch.cuda.device_count())
 
 # from torchvision.models import vgg16
 
@@ -94,13 +91,14 @@ class DnnLayerWeightExperiment():
         device = next(model.parameters()).device  
         self.base_model = self.base_model.to(device)
         self.model = model
+        self.TRAIN_RATIO = 0.8
         self._N_EPOCHS = None
-
+        
         self.max_weights_std = None
 
         self.preloaded = preloaded
 
-        ## GUARANTEE THE SAME COLOR SCHEME ACROSS PLOTS
+        ## guarantee the same color scheme across plots for readability
         if not self.preloaded:
             self._color_palette = px.colors.qualitative.Plotly
             self._layer_color_map = {
@@ -140,6 +138,7 @@ class DnnLayerWeightExperiment():
 
         # model output instance attributes
         self.train_accuracies = []
+        self.val_accuracies = []
         self.test_accuracies = []
 
         self.layer_summary_stats = {}
@@ -157,21 +156,38 @@ class DnnLayerWeightExperiment():
         }
     
     # Define the transformations for the data
+    # Create the dataloaders for train, validation, and test
+
     def load_dataset(self):
-        # Download and load the training and test datasets
+        # Download and load the training, validation, and test datasets
+
         if self.dataset_name == 'fashion_mnist':
             transform = transforms.Compose([
                 transforms.ToTensor(),
                 transforms.Normalize((0.5,), (0.5,))
             ])
-            self.train_data = datasets.FashionMNIST('./data', train=True, transform=transform, download=True)
+
+            ## download training data and split into train and validation
+            dataset = datasets.FashionMNIST('./data', train=True, transform=transform, download=True)
+            dataset_size = len(dataset)
+            train_size = int(self.TRAIN_RATIO * dataset_size)
+            val_size = dataset_size - train_size
+
+            self.train_data, self.val_data = random_split(dataset, [train_size, val_size])
             self.test_data = datasets.FashionMNIST('./data', train=False, transform=transform, download=True)
+
         elif self.dataset_name == 'mnist':
             transform = transforms.Compose([
                 transforms.ToTensor(),
                 transforms.Normalize((0.5,), (0.5,))
             ])
-            self.train_data = datasets.MNIST('./data', train=True, transform=transform, download=True)
+
+            dataset = datasets.MNIST('./data', train=True, transform=transform, download=True)
+            dataset_size = len(dataset)
+            train_size = int(self.TRAIN_RATIO * dataset_size)
+            val_size = dataset_size - train_size
+
+            self.train_data, self.val_data = random_split(dataset, [train_size, val_size])
             self.test_data = datasets.MNIST('./data', train=False, transform=transform, download=True)
         
         ## this hasn't been tested yet
@@ -182,19 +198,32 @@ class DnnLayerWeightExperiment():
                 (0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010) 
                 )
             ])
-            # transform = transforms.Compose([
-            #     transforms.ToTensor(),
-            #     transforms.Normalize((0.5,), (0.5,))
-            # ])
-            self.train_data = datasets.CIFAR10('./data', train=True, transform=transform, download=True)
+
+            dataset = datasets.CIFAR10('./data', train=True, transform=transform, download=True)
+            dataset_size = len(dataset)
+            train_size = int(self.TRAIN_RATIO * dataset_size)
+            val_size = dataset_size - train_size
+
+            self.train_data, self.val_data = random_split(dataset, [train_size, val_size])
             self.test_data = datasets.CIFAR10('./data', train=False, transform=transform, download=True)
+
         else:
             raise Exception("Dataset {self.dataset_name} not supported")
         
+        ## create DataLoaders
+        trainloader = torch.utils.data.DataLoader(self.train_data, batch_size=128, shuffle=True, num_workers=8)
+        valloader = torch.utils.data.DataLoader(self.val_data, batch_size=128, shuffle=False, pin_memory=True)
+        testloader = torch.utils.data.DataLoader(self.test_data, batch_size=128, shuffle=True, num_workers=8)
+        self.dataloaders = {
+            'train': trainloader,
+            'validation': valloader,
+            'test': testloader
+        }
 
     def train_base_model(self, N_EPOCHS=30, regularizer=None):
+
         self._N_EPOCHS = N_EPOCHS
-        trainloader = torch.utils.data.DataLoader(self.train_data, batch_size=100, shuffle=True, num_workers=8)
+        
         device = next(self.base_model.parameters()).device
 
         ## data is expected to be in batches
@@ -221,6 +250,7 @@ class DnnLayerWeightExperiment():
         # best_train_accuracy = 0.0
         best_test_accuracy = 0.0 
         best_model_state = None
+
         train_accuracies = []
         test_accuracies = []
 
@@ -237,33 +267,29 @@ class DnnLayerWeightExperiment():
             } for i in range(1,self.model._N_LAYERS+1)
         }
 
-        ## try learning rates [0.0001, 0.001, 0.01]
-        ## maybe scale up later if needed for more experiments
-        ## learning rates for adam?
-        # lr_adam = [3*10**-4, 5*10**-4, 10**-3]
-        lr_sgd = [0.0001, 0.001, 0.01]
+        lrs = [0.0001, 0.001, 0.01]
 
-        lr_decay_factor = 0.5
-
-        ## detect a plateau (e.g. an average change of < 0.01 over a period of 20 epochs)
-        plateau_threshold = 0.01
-        plateau_epochs = 20
-        
-        for lr in lr_sgd:
+        for lr in lrs:
 
             print(f"Trying learning rate = {lr}")
 
             optimizer = optim.SGD(self.model.parameters(), lr=lr, momentum=0.9, weight_decay=l2_lambda, nesterov=True)
-
-            ## optimizer = optim.Adam(self.model.parameters(), lr=lr, betas=(0.9,0.999), weight_decay=l2_lambda)
-            # scheduler = ExponentialLR(optimizer, gamma=0.9)
+            scheduler = ReduceLROnPlateau(optimizer, 'min', patience=10, factor=0.25)
 
             for epoch in range(N_EPOCHS):
 
-                loss = 0.0
-                correct = 0
-                total = 0
-                for images, labels in trainloader:
+                train_loss = 0.0
+                
+                train_correct = 0
+                train_total = 0
+
+                val_loss = 0.0
+                val_total = 0
+
+                # Training phase
+                for images, labels in self.dataloaders['train']:
+
+                    ## move the data to device (CPU/GPU)
                     images=images.to(device)
                     labels=labels.to(device)
                     self.model.train()
@@ -271,27 +297,43 @@ class DnnLayerWeightExperiment():
                     optimizer.zero_grad()
                     outputs=self.model(images)
 
-                    _, predicted = torch.max(outputs.data, 1)
-                    total += labels.size(0)
-                    correct += (predicted == labels).sum().item()
+                    _, predicted = torch.max(outputs, 1)
+                    train_total += labels.size(0)
+                    train_correct += (predicted == labels).sum().item()
 
                     loss = loss_function(outputs, labels)
 
-                    # + l2_lambda*l2_loss ## this is where we use the l2 regularizer
-                    # but this is redundant if we include it in the optimizer itself
-
                     loss.backward()
                     optimizer.step()
-                
-                train_accuracy = correct / total
-                train_accuracies.append(train_accuracy)
+                    train_loss += loss.item() * images.size(0)
 
-                training_loss = loss.item()
-                if np.isnan(training_loss):
+                train_accuracy = train_correct / train_total
+                train_accuracies.append(train_accuracy)
+                
+                train_loss /= len(self.dataloaders['train'])
+                
+                # Validation phase, we only calculate loss to determine plateauing
+                self.model.eval()
+                with torch.no_grad():
+                    for images, labels in self.dataloaders['validation']:
+                        images=images.to(device)
+                        labels=labels.to(device)
+                        outputs = self.model(images)
+
+                        loss = loss_function(outputs, labels)
+                        val_loss += loss.item() * images.size(0)
+                
+                val_loss /= len(self.dataloaders['validation'])
+                print(f"val loss: {val_loss}")
+
+                scheduler.step(val_loss)
+
+                if np.isnan(train_loss):
                     print(f"Training did not converge for learning rate = {lr}")
                     break
-
-                print(f"Epoch {epoch}: training_loss = {training_loss}, train accuracy = {train_accuracy:.2%}")
+                
+                current_lr = optimizer.param_groups[0]['lr']
+                print(f"Epoch {epoch}, lr = {current_lr}: training_loss = {train_loss}, train accuracy = {train_accuracy:.2%}")
                 
                 ## for each epoch, we need to get layer weight std and condition number
 
@@ -326,21 +368,13 @@ class DnnLayerWeightExperiment():
                 test_accuracy = self.get_test_accuracy()
                 test_accuracies.append(test_accuracy)
 
-                ## if plateauing is occurring, we need to change the learning rate
-                if epoch % plateau_epochs == 0:
-                    avg_epoch_change = np.mean(np.diff(np.array(test_accuracies[-plateau_epochs:])))
-                    if avg_epoch_change < plateau_threshold:
-                        lr = lr * lr_decay_factor
-                        print(f"test accuracy has plateaued at epoch {epoch}, new learning rate = {lr}")
-                        optimizer = optim.SGD(self.model.parameters(), lr=lr, momentum=0.9, weight_decay=l2_lambda, nesterov=True)
-
             ## model training is completed for some learning rate, lr
             ## check if the accuracy is above a certain threshold AND better than previous accuracy
-            if (train_accuracy <= 0.10) | (np.isnan(training_loss)):
-                print(f"Training did not converge for learning rate = {lr}")
+            if (train_accuracy <= 0.10) | (np.isnan(train_loss)):
+                print(f"Training did not converge for (starting) learning rate = {lr}")
 
             else:
-                print(f"Training successfully converged for learning rate = {lr}")
+                print(f"Training successfully converged for (starting) learning rate = {lr}")
 
                 ## when we improve on the current best test accuracy
                 ## we set all of the model parameters equal the current state of the model
@@ -394,11 +428,6 @@ class DnnLayerWeightExperiment():
         ## then loop through layers of the model:
         ## extract the initial and final weights, and calculate summary stats of each layer's weights 
         ## these can be accessed later for data visualization, debugging, and analysis
-
-        # print(self.model)
-        # print("\n")
-        # for name, layer in self.model.named_parameters():
-        #     print(name)
         
         n = 1
         for name, layer in self.model.named_parameters():
@@ -420,12 +449,12 @@ class DnnLayerWeightExperiment():
         # print(self.model_layer_info)
 
     def get_test_accuracy(self) -> float:
+        
         # Ensure model is in evaluation mode
         self.model.eval()
 
         # Get the device and DataLoader
         device = next(self.model.parameters()).device
-        valloader = torch.utils.data.DataLoader(self.test_data, batch_size=100, shuffle=False, pin_memory=True)
         
         # Initialize counters
         correct = 0
@@ -433,7 +462,7 @@ class DnnLayerWeightExperiment():
 
         # Disable gradient computation for efficiency
         with torch.no_grad():
-            for images, labels in valloader:
+            for images, labels in self.dataloaders['test']:
                 images, labels = images.to(device), labels.to(device)
                 outputs = self.model(images)
                 _, predicted = torch.max(outputs.data, 1)
@@ -670,9 +699,6 @@ class DnnLayerWeightExperiment():
         ################################################ 
         # FOR PRELOADED MODEL, ONLY PLOT FINAL WEIGHTS 
         ################################################
-
-        # print('layer names:')
-        # print([layer for layer in self.model.state_dict()])
         
         if self.preloaded:
             all_feature_layers = [layer for layer in self.model.state_dict() if "feature" in layer]
@@ -1003,7 +1029,7 @@ if __name__ == "__main__":
     cloud_environment = args.cloud_environment
     debug = True if args.debug_mode == "debug" else False
     if debug:
-        N_EPOCHS = 20
+        N_EPOCHS = 100
     else:
         N_EPOCHS = 400
 
@@ -1048,13 +1074,10 @@ if __name__ == "__main__":
 
         random_seed = 42
         noise_random_seed = 42
-        dnn1 = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[512, 256, 128, 64], random_seed=random_seed, init_type="normal")
+        # dnn1 = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[128, 128, 128, 128, 128, 128, 128], random_seed=random_seed, init_type="normal")
         dnn2 = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[256, 256, 256, 256, 256, 256, 256], random_seed=random_seed, init_type="normal")
-        dnn3 = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[64, 128, 256, 512], random_seed=random_seed, init_type="normal")
         dnn_experiments = {
-            'dnn1': dnn1,
             'dnn2': dnn2,
-            'dnn3': dnn3,
         }
         dnn_experiments_results = run_dnn_experiments(dnn_experiments, N_EPOCHS=N_EPOCHS, noise_random_seed=42, directory=directory, MAX_TRAIN_ATTEMPTS=5, regularizer="l2", debug=debug)
         
@@ -1102,16 +1125,3 @@ if __name__ == "__main__":
         end = time.time()
         runtime = (end - start) / 60
         print(f"Total runtime = {runtime:.2f} minutes")
-
-    ## LEGACY SCRATCH WORK
-
-    # Load ResNet18
-    # resnet18_model = resnet18()
-
-    # # Modify conv1 for CIFAR-10 (adjust for 32x32 images)
-    # resnet18_model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-    # resnet18_model.maxpool = nn.Identity()  # Remove maxpool for smaller images
-
-    # # Modify the fully connected layer for 10 classes (CIFAR-10)
-    # resnet18_model.fc = nn.Linear(512, 10)
-    # resnet18_model.load_state_dict(torch.load('./cifar10_models/state_dicts/resnet18.pt'))

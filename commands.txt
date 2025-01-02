@@ -1,0 +1,38 @@
+## to configure my aiml environment
+module load anaconda/2024.06-py312
+module load cuda/11.7
+source activate aiml
+conda activate aiml 
+
+## start running experiments by submitting .sh file
+## export PYTORCH_ENABLE_MPS_FALLBACK='1'
+sbatch /cluster/home/doconn10/experiments/run_dnn_weight_experiments.sh
+
+## list all packages in environment aiml
+conda list -n aiml 
+
+## current status of job run on 10/10/24
+squeue --user=doconn10 
+##   JOBID PARTITION     NAME     USER ST       TIME  NODES NODELIST(REASON)
+## 7833699     batch pytestjo doconn10  R      29:45      1 d1cmp017
+
+
+## to show all jobs
+sacct --user=doconn10
+
+conda install pytorch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 pytorch-cuda=11.7 -c pytorch -c nvidia
+
+
+
+
+
+⁠srun -p gpu -t 4:00:00 -n 2 --mem=2g --gres=gpu:1 --pty bash ⁠
+⁠srun -p interactive -t 4:00:00 -n 2 --mem=2g --gres=gpu:1 --pty bash ⁠
+
+## to debug locally
+export PYTORCH_ENABLE_MPS_FALLBACK='1'
+python -i dnn_weight_noise.py --experiment-version v27 --experiment-type cnn --cloud-environment local --debug-mode debug
+
+python: to display the version of torch and see cuda compatibility 
+import torch
+print(torch.__version__) 
