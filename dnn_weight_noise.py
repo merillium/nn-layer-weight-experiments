@@ -1,5 +1,6 @@
 import argparse
 import copy
+import json
 import os
 import time
 import numpy as np
@@ -8,6 +9,7 @@ import re
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import ExponentialLR, ReduceLROnPlateau
 from torch.utils.data import DataLoader, random_split
@@ -21,15 +23,12 @@ from utils import fit_gaussian_curve, init_weights, equalize_axes_layout
 
 # from cifar10_models.vgg import vgg11_bn, vgg13_bn, vgg16_bn, vgg19_bn
 
-## torch info
-print(torch.__version__)
-print(torch.cuda.is_available())
-print(torch.cuda.device_count())
-
 # from torchvision.models import vgg16
 
+# print(torch.__version__)
+# print(torch.cuda.is_available())
+# print(torch.cuda.device_count())
 device = ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
-os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = "1"
 
 class DNN(nn.Module):
     def __init__(self, N_CLASSES, HIDDEN_LAYER_WIDTHS, random_seed, init_type):
@@ -48,16 +47,19 @@ class DNN(nn.Module):
         if device=="cuda":
             torch.cuda.manual_seed(self.random_seed)
 
-        ## NOTE: ideally we should parametrize 28 x 28
+        ## NOTE: ideally we should parametrize 28 x 28 or 32 x 32
         ## and construct the layers a more dynamic fashion
         hidden_layers = []
         for i, layer_width in enumerate(self._HIDDEN_LAYER_WIDTHS):
             if i == 0:
-                first_hidden_layer = nn.Linear(28 * 28, layer_width)
+                first_hidden_layer = nn.Linear(32 * 32 * 3, layer_width)
                 hidden_layers.append(first_hidden_layer)
             else:
                 previous_layer_width = self._HIDDEN_LAYER_WIDTHS[i-1]
                 hidden_layers.append(nn.Linear(previous_layer_width, layer_width))
+            
+            ## add RELU activation layer
+            hidden_layers.append(nn.ReLU())
         output_layer = [nn.Linear(self._HIDDEN_LAYER_WIDTHS[-1], self._N_CLASSES)]
         all_layers = hidden_layers + output_layer
 
@@ -71,7 +73,7 @@ class DNN(nn.Module):
         self.linear_relu_stack.apply(lambda m: init_weights(m, self.init_type, self.random_seed))
     
     def forward(self, x):
-        x = x.view(-1, 28 * 28)
+        x = x.view(-1, 32 * 32 * 3) # this should be parametrized ideally
         x = self.linear_relu_stack(x)
         return x
 
@@ -90,6 +92,7 @@ class DnnLayerWeightExperiment():
         self.base_model = copy.deepcopy(model)
         device = next(model.parameters()).device  
         self.base_model = self.base_model.to(device)
+        self.best_lr = None
         self.model = model
         self.TRAIN_RATIO = 0.8
         self._N_EPOCHS = None
@@ -121,7 +124,9 @@ class DnnLayerWeightExperiment():
                     'final_weights': None,
                     'final_biases': None,
                     'weight_std_by_epoch': [],
-                    'cond_number_by_epoch': []
+                    'cond_number_by_epoch': [],
+                    'min_singular_value_by_epoch': [],
+                    'max_singular_value_by_epoch': [],
                 } for i in range(1,self.model._N_LAYERS+1)
             }
 
@@ -142,13 +147,20 @@ class DnnLayerWeightExperiment():
         self.test_accuracies = []
 
         self.layer_summary_stats = {}
-        self.all_layer_noise_test_acc = {}
+        self.all_layer_noise_test_acc = {
+            'input_dim': {},
+            'output_dim': {},
+            'layer_variance': {},
+            'noise_vars': None,
+        }
         self.layer_condition_numbers = {}
 
         self.all_figures = {
             'initial_weights': None,
             'final_weights': None,
             'condition_numbers_by_epoch': None,
+            'min_singular_value_by_epoch': None,
+            'max_singular_value_by_epoch': None,
             'weight_stds_by_epoch': None,
             'accuracies_by_epoch': None,
             'noise_test_accuracies': None,
@@ -195,8 +207,7 @@ class DnnLayerWeightExperiment():
             transform = transforms.Compose([
                 transforms.ToTensor(),
                 transforms.Normalize( 
-                (0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010) 
-                )
+                (0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
             ])
 
             dataset = datasets.CIFAR10('./data', train=True, transform=transform, download=True)
@@ -211,16 +222,16 @@ class DnnLayerWeightExperiment():
             raise Exception("Dataset {self.dataset_name} not supported")
         
         ## create DataLoaders
-        trainloader = torch.utils.data.DataLoader(self.train_data, batch_size=128, shuffle=True, num_workers=8)
+        trainloader = torch.utils.data.DataLoader(self.train_data, batch_size=128, shuffle=True, num_workers=2)
         valloader = torch.utils.data.DataLoader(self.val_data, batch_size=128, shuffle=False, pin_memory=True)
-        testloader = torch.utils.data.DataLoader(self.test_data, batch_size=128, shuffle=True, num_workers=8)
+        testloader = torch.utils.data.DataLoader(self.test_data, batch_size=128, shuffle=True, num_workers=2)
         self.dataloaders = {
             'train': trainloader,
             'validation': valloader,
             'test': testloader
         }
 
-    def train_base_model(self, N_EPOCHS=30, regularizer=None):
+    def train_base_model(self, N_EPOCHS=30, dnn_learning_rates=[], regularizer=None):
 
         self._N_EPOCHS = N_EPOCHS
         
@@ -263,18 +274,22 @@ class DnnLayerWeightExperiment():
                 'final_weights': None,
                 'final_biases': None,
                 'weight_std_by_epoch': [],
-                'cond_number_by_epoch': []
+                'cond_number_by_epoch': [],
+                'min_singular_value_by_epoch': [],
+                'max_singular_value_by_epoch': [],
             } for i in range(1,self.model._N_LAYERS+1)
         }
 
-        lrs = [0.0001, 0.001, 0.01]
+        lrs = dnn_learning_rates
 
         for lr in lrs:
 
             print(f"Trying learning rate = {lr}")
 
-            optimizer = optim.SGD(self.model.parameters(), lr=lr, momentum=0.9, weight_decay=l2_lambda, nesterov=True)
-            scheduler = ReduceLROnPlateau(optimizer, 'min', patience=10, factor=0.25)
+            # optimizer = optim.SGD(self.model.parameters(), lr=lr, momentum=0.9, weight_decay=l2_lambda, nesterov=True)
+            optimizer = optim.Adam(self.model.parameters(), lr=lr)
+            scheduler = ReduceLROnPlateau(optimizer, 'min', patience=10, factor=0.75)
+            
 
             for epoch in range(N_EPOCHS):
 
@@ -298,6 +313,10 @@ class DnnLayerWeightExperiment():
                     outputs=self.model(images)
 
                     _, predicted = torch.max(outputs, 1)
+
+                    # print(f"predicted: {predicted.size()}")
+                    # print(f"labels: {labels.size()}")
+
                     train_total += labels.size(0)
                     train_correct += (predicted == labels).sum().item()
 
@@ -305,7 +324,7 @@ class DnnLayerWeightExperiment():
 
                     loss.backward()
                     optimizer.step()
-                    train_loss += loss.item() * images.size(0)
+                    train_loss += loss.item()
 
                 train_accuracy = train_correct / train_total
                 train_accuracies.append(train_accuracy)
@@ -321,7 +340,7 @@ class DnnLayerWeightExperiment():
                         outputs = self.model(images)
 
                         loss = loss_function(outputs, labels)
-                        val_loss += loss.item() * images.size(0)
+                        val_loss += loss.item()
                 
                 val_loss /= len(self.dataloaders['validation'])
                 print(f"val loss: {val_loss}")
@@ -355,6 +374,13 @@ class DnnLayerWeightExperiment():
                             model_layer_info[f'layer_{n}']['cond_number_by_epoch'].append(cond_number)
                             model_layer_info[f'layer_{n}']['weight_std_by_epoch'].append(weight_std)
 
+                            U,S,V = np.linalg.svd(layer_weights) 
+                            min_singular_value = S.min()
+                            max_singular_value = S.max()
+
+                            model_layer_info[f'layer_{n}']['min_singular_value_by_epoch'].append(min_singular_value)
+                            model_layer_info[f'layer_{n}']['max_singular_value_by_epoch'].append(max_singular_value)
+
                             n += 1
 
                         except Exception as e:
@@ -384,14 +410,12 @@ class DnnLayerWeightExperiment():
 
                 if (test_accuracy > best_test_accuracy):
                     print(f"Better test accuracy = {test_accuracy} found for learning rate {lr}, overwriting model")
+                    self.best_lr = lr
                     best_test_accuracy = test_accuracy # primitives are immutable! if test_accuracy changes, won't impact best_test_accuracy
                     best_model_state = copy.deepcopy(self.model.state_dict())
 
                     # print("setting self.model_layer_info to model_layer_info (shown below)")
                     self.model_layer_info = copy.deepcopy(model_layer_info)
-                    # print("\n")
-                    # print(self.model_layer_info)
-                    # print("\n")
                     self.train_accuracy = train_accuracy # saves train accuracy corresponding to best test accuracy
                     self.train_accuracies = train_accuracies
                     self.test_accuracy = test_accuracy
@@ -410,7 +434,9 @@ class DnnLayerWeightExperiment():
                 'final_weights': None,
                 'final_biases': None,
                 'weight_std_by_epoch': [],
-                'cond_number_by_epoch': []
+                'cond_number_by_epoch': [],
+                'min_singular_value_by_epoch': [],
+                'max_singular_value_by_epoch': [],
             } for i in range(1,self.model._N_LAYERS+1)
         }
 
@@ -498,10 +524,10 @@ class DnnLayerWeightExperiment():
 
                 ## HEATMAP OF WEIGHTS MATRIX
 
-                fig_heatmap = make_subplots(
-                    rows=int(np.ceil(self.model._N_LAYERS/2)), cols=2,
-                    subplot_titles=[f"Layer {i} weights" for i in range(1,self.model._N_LAYERS+1)]
-                )
+                # fig_heatmap = make_subplots(
+                #     rows=int(np.ceil(self.model._N_LAYERS/2)), cols=2,
+                #     subplot_titles=[f"Layer {i} weights" for i in range(1,self.model._N_LAYERS+1)]
+                # )
 
                 fig_singular_values = make_subplots(
                     rows=int(np.ceil(self.model._N_LAYERS/2)), cols=2,
@@ -573,7 +599,7 @@ class DnnLayerWeightExperiment():
                         ), row=row, col=col)
                     
                     ## HEATMAP OF LAYER WEIGHTS
-                    fig_heatmap.append_trace(go.Heatmap(z=weights_matrix, zmin=zmin, zmax=zmax), row=row, col=col)
+                    # fig_heatmap.append_trace(go.Heatmap(z=weights_matrix, zmin=zmin, zmax=zmax), row=row, col=col)
                     
                     fig_histogram.add_annotation(
                         xref="x domain",yref="y domain",
@@ -586,8 +612,6 @@ class DnnLayerWeightExperiment():
                     ### HISTOGRAM OF SINGULAR VALUES
                     try:
                         U,S,V = np.linalg.svd(weights_matrix) 
-
-                        r = S.max()
 
                         fig_singular_values.append_trace(
                             go.Histogram(x=S, marker=dict(color=self._layer_color_map[f"layer_{i}"]), name=f"layer_{i}"),
@@ -611,10 +635,6 @@ class DnnLayerWeightExperiment():
                 ## add descriptive titles with summary stats
                 final_train_accuracy = self.train_accuracies[-1]
                 final_test_accuracy = self.test_accuracies[-1]
-                fig_heatmap.update_layout(title=f"""
-                                DNN with {self.model._N_LAYERS} layers + layer widths of {self.model._HIDDEN_LAYER_WIDTHS}: final train acc = {final_train_accuracy:.2%}, final test_acc = {final_test_accuracy:.2%}
-                                <br>Heatmap of {weight_type} Weights by Layer ({self.dataset_name}, seed = {self.model.random_seed})<br>""",
-                                margin=dict(t=120, l=50, r=50, b=50))
                 
                 fig_histogram.update_layout(title=f"""
                                 DNN with {self.model._N_LAYERS} layers + layer widths of {self.model._HIDDEN_LAYER_WIDTHS}: final train acc = {final_train_accuracy:.2%}, final test_acc = {final_test_accuracy:.2%}
@@ -625,14 +645,16 @@ class DnnLayerWeightExperiment():
                                 DNN with {self.model._N_LAYERS} layers + layer widths of {self.model._HIDDEN_LAYER_WIDTHS}: final train acc = {final_train_accuracy:.2%}, final test_acc = {final_test_accuracy:.2%}
                                 <br>Singular Values of {weight_type} Weights by Layer ({self.dataset_name}, seed = {self.model.random_seed})<br>""",
                                 margin=dict(t=120, l=50, r=50, b=50))
-
-                fig_heatmap = equalize_axes_layout(fig_heatmap)
+                
+                # fig_heatmap.update_layout(title=f"""
+                #                 DNN with {self.model._N_LAYERS} layers + layer widths of {self.model._HIDDEN_LAYER_WIDTHS}: final train acc = {final_train_accuracy:.2%}, final test_acc = {final_test_accuracy:.2%}
+                #                 <br>Heatmap of {weight_type} Weights by Layer ({self.dataset_name}, seed = {self.model.random_seed})<br>""",
+                #                 margin=dict(t=120, l=50, r=50, b=50))
+                # fig_heatmap = equalize_axes_layout(fig_heatmap)
                 # fig_singular_values = equalize_axes_layout(fig_singular_values)
-
                 
                 self.all_figures[weight_type_key] = {
                     'histogram': fig_histogram,
-                    'heatmap': fig_heatmap,
                     'singular_values': fig_singular_values
                 }
             
@@ -644,6 +666,18 @@ class DnnLayerWeightExperiment():
             fig_weight_stds = make_subplots(
                 rows=int(np.ceil(self.model._N_LAYERS/2)), cols=2,
                 subplot_titles=[f"Layer {i}" for i in range(1,self.model._N_LAYERS+1)]
+            )
+            
+            fig_min_singular_values = make_subplots(
+                rows=int(np.ceil(self.model._N_LAYERS/2)), cols=2,
+                subplot_titles=[f"Min Singular Values for Layer {i} weights" for i in range(1,self.model._N_LAYERS+1)],
+                vertical_spacing=0.05
+            )
+
+            fig_max_singular_values = make_subplots(
+                rows=int(np.ceil(self.model._N_LAYERS/2)), cols=2,
+                subplot_titles=[f"Max Singular Values for Layer {i} weights" for i in range(1,self.model._N_LAYERS+1)],
+                vertical_spacing=0.05
             )
 
             for i in range(1, self.model._N_LAYERS+1):
@@ -666,6 +700,24 @@ class DnnLayerWeightExperiment():
                 )
                 fig_condition_numbers.update_yaxes(range=[0, final_condition_number*1.2], row=row, col=col)
 
+                fig_min_singular_values.append_trace(
+                    go.Scatter(
+                        x=list(range(self._N_EPOCHS)), 
+                        y=self.model_layer_info[f'layer_{i}']['min_singular_value_by_epoch'],
+                        name=f'layer_{i}',
+                        marker=dict(color=self._layer_color_map[f"layer_{i}"]),
+                    ), row=row, col=col
+                )
+                
+                fig_max_singular_values.append_trace(
+                    go.Scatter(
+                        x=list(range(self._N_EPOCHS)), 
+                        y=self.model_layer_info[f'layer_{i}']['max_singular_value_by_epoch'],
+                        name=f'layer_{i}',
+                        marker=dict(color=self._layer_color_map[f"layer_{i}"]),
+                    ), row=row, col=col
+                )
+
                 fig_weight_stds.append_trace(
                     go.Scatter(
                         x=list(range(self._N_EPOCHS)), 
@@ -675,7 +727,6 @@ class DnnLayerWeightExperiment():
                     ), row=row, col=col
                 )
 
-                
             fig_condition_numbers.update_layout(title=f"""
                             DNN with {self.model._N_LAYERS} layers + layer widths of {self.model._HIDDEN_LAYER_WIDTHS}: final train acc = {final_train_accuracy:.2%}, final test_acc = {final_test_accuracy:.2%}
                             <br>Condition Number of Layer Weights by Epoch ({self.dataset_name}, seed = {self.model.random_seed})<br>""")
@@ -689,15 +740,16 @@ class DnnLayerWeightExperiment():
             fig_accuracies.add_trace(go.Scatter(x=list(range(self._N_EPOCHS)), y=self.test_accuracies, name='test accuracy'))
             fig_accuracies.update_layout(title=f"""
                             DNN with {self.model._N_LAYERS} layers + layer widths of {self.model._HIDDEN_LAYER_WIDTHS}: train acc = {final_train_accuracy:.2%}, final test_acc = {final_test_accuracy:.2%}
-                            <br>Train and Test Accuracies by Epoch ({self.dataset_name}, seed = {self.model.random_seed})<br>""")
+                            <br>Train and Test Accuracies by Epoch ({self.dataset_name}, lr = {self.best_lr}, seed = {self.model.random_seed})<br>""")
             
             self.all_figures['condition_numbers_by_epoch'] = fig_condition_numbers
             self.all_figures['weight_stds_by_epoch'] = fig_weight_stds
             self.all_figures['accuracies_by_epoch'] = fig_accuracies
-
+            self.all_figures['min_singular_values_by_epoch'] = fig_min_singular_values
+            self.all_figures['max_singular_values_by_epoch'] = fig_max_singular_values
 
         ################################################ 
-        # FOR PRELOADED MODEL, ONLY PLOT FINAL WEIGHTS 
+        # FOR PRELOADED MODEL, ONLY PLOT FINAL WEIGHTS #
         ################################################
         
         if self.preloaded:
@@ -785,7 +837,7 @@ class DnnLayerWeightExperiment():
     #####  EXPERIMENT 2: freeze layers and then add noise  #####
     ############################################################
 
-    def create_models_with_noise(self, N_NOISE_SAMPLES=10):
+    def create_models_with_noise(self, N_NOISE_SAMPLES=10, noise_vars=[0.1, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]):
         
         np.random.seed(self.noise_random_seed)
         device = next(self.model.parameters()).device
@@ -802,22 +854,23 @@ class DnnLayerWeightExperiment():
         #     ...
         
         if not self.preloaded:
-            noise_vars = [0.1, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
-            self.all_layer_noise_test_acc["noise_vars"] = noise_vars
+            for noise_type in ["input_dim","output_dim","layer_variance"]:
+                self.all_layer_noise_test_acc[noise_type]["noise_vars"] = noise_vars
             n_stack_layers = [int(''.join(filter(str.isdigit, layer))) for layer in self.model.state_dict() if (("weight" in layer) and ("classifier" not in layer))]
             print(n_stack_layers)
         
         ## a preloaded CNN model has a different architecture
         else:
             # get standard deviation corresponding to the largest layer
-            
             # noise_stds = np.linspace(0, self.max_weights_std, 6)
 
-            noise_stds = np.linspace(0, 0.08, 6)
-            noise_vars = noise_stds**2
+            # noise_stds = np.linspace(0, 0.08, 6)
+            # noise_vars = noise_stds**2
             # noise_vars = [0.1, 0.4, 0.7, 1.0, 1.4, 1.7, 2.0]
 
             ## store the noise vars to be plotted (true noise vars may be scaled)
+            for noise_type in ["input_dim","output_dim","layer_variance"]:
+                self.all_layer_noise_test_acc[noise_type]["noise_vars"] = noise_vars
             self.all_layer_noise_test_acc["noise_vars"] = noise_vars
             
             all_feature_layers = [layer for layer in self.model.state_dict() if "feature" in layer]
@@ -843,182 +896,217 @@ class DnnLayerWeightExperiment():
 
         for n_stack in n_stack_layers:
             ## for a particular layer (n_stack), keep track of the test_accuracy vs noise
-            layer_avg_test_accs = []
-            for noise_var in noise_vars: 
-
-                test_acc_sum = 0
-
-                ## average test accuracy over N_NOISE_SAMPLES
-                for _ in range(N_NOISE_SAMPLES):
-                    
-                    ## create new instance of base model to add noise to
-                    new_experiment = copy.deepcopy(self)
-
-                    ## find the layer, add noise
-                    with torch.no_grad():
-                        if not self.preloaded:
-                            weight_layer_string = f"linear_relu_stack.{n_stack}.weight"
-                            bias_layer_string = f"linear_relu_stack.{n_stack}.bias"
-                        else:
-                            weight_layer_string = f"features.{n_stack}.weight"
-                            bias_layer_string = f"features.{n_stack}.bias"
-                        
-                        print(f"adding noise to {weight_layer_string} weights")
-
-                        weight_layer_size = new_experiment.model.state_dict()[weight_layer_string].data.shape
-                        bias_layer_size = new_experiment.model.state_dict()[bias_layer_string].data.shape
-                        # print(f"size = {size}")
-
-                        ## get width of previous layer
-                        if not self.preloaded:
-                            if n_stack == 0:
-                                layer_width = self.model._HIDDEN_LAYER_WIDTHS[n_stack]
-                            else:
-                                layer_width = self.model._HIDDEN_LAYER_WIDTHS[n_stack-1]
-
-                            true_noise_var =  noise_var / layer_width
-                        
-                        if self.preloaded:
-                            # layer_width = size[0]
-                            # print(f"layer_width = {layer_width}")
-                            # true_noise_var = noise_var / layer_width
-                            true_noise_var = noise_var
-
-                        weight_noise = torch.normal(mean=0, std=np.sqrt(true_noise_var), size=weight_layer_size).to(device)
-                        bias_noise = torch.normal(mean=0, std=np.sqrt(true_noise_var), size=bias_layer_size).to(device)
-
-                        ## add noise to both (bias) and weight layers
-                        ## bias_layer_string = f"features.{n_stack}.bias"
-
-                        new_experiment.model.state_dict()[weight_layer_string].data += weight_noise
-                        new_experiment.model.state_dict()[bias_layer_string].data += bias_noise
-                        
-
-                    ## after noise has been added to a layer, get the accuracy
-                    test_acc = new_experiment.get_test_accuracy()
-                    print(f"test accuracy for {weight_layer_string} = {test_acc:.2%}")
-
-                    test_acc_sum += test_acc
-
-                avg_test_acc = test_acc_sum/N_NOISE_SAMPLES
-                layer_avg_test_accs.append(avg_test_acc)
-                print(f"Average test accuracy for {weight_layer_string} with N = {N_NOISE_SAMPLES} samples of noise at vars = {noise_var}: {avg_test_acc:.2%}")
             
-            # layer_number = (2 + int((n_stack-1)/2)) if n_stack != 0 else 1
-            # print(f'setting layer_{layer_number}')
+            for noise_type in ["input_dim","output_dim","layer_variance"]:
+                layer_avg_test_accs = []
+                
+                for noise_var in noise_vars: 
+                    test_acc_sum = 0
 
-            self.all_layer_noise_test_acc[f'layer_{n_stack+1}'] = np.array(layer_avg_test_accs)
+                    
+                    ## layer weights have dimension (output_dim, input_dim)
+                    if not self.preloaded:
+                        if noise_type == "input_dim":
+                            layer_width = self.model_layer_info[f"layer_{n_stack+1}"]["final_weights"].shape[1]
+                            true_noise_var =  noise_var / layer_width
+                        elif noise_type == "output_dim":
+                            layer_width = self.model_layer_info[f"layer_{n_stack+1}"]["final_weights"].shape[0]
+                            true_noise_var =  noise_var / layer_width
+                        elif noise_type == "layer_variance":
+                            weight_layer_stdev = self.model_layer_info[f"layer_{n_stack+1}"]["weight_std_by_epoch"][-1]
+                            true_noise_var =  weight_layer_stdev**2 * noise_var / layer_width
+                    
+                    if self.preloaded:
+                        true_noise_var = noise_var
+
+                    ## average test accuracy over N_NOISE_SAMPLES
+                    for _ in range(N_NOISE_SAMPLES):
+                        
+                        ## create new instance of base model to add noise to
+                        # new_experiment = copy.deepcopy(self)
+
+                        ## find the layer, add noise
+                        with torch.no_grad():
+                            if not self.preloaded:
+                                weight_layer_string = f"linear_relu_stack.{n_stack}.weight"
+                                bias_layer_string = f"linear_relu_stack.{n_stack}.bias"
+                            else:
+                                weight_layer_string = f"features.{n_stack}.weight"
+                                bias_layer_string = f"features.{n_stack}.bias"
+                            
+                            print(f"adding noise to {weight_layer_string} weights")
+
+                            weight_layer_size = self.model.state_dict()[weight_layer_string].data.shape
+                            bias_layer_size = self.model.state_dict()[bias_layer_string].data.shape
+                            # print(f"size = {size}")
+
+                            weight_noise = torch.normal(mean=0, std=np.sqrt(true_noise_var), size=weight_layer_size).to(device)
+                            bias_noise = torch.normal(mean=0, std=np.sqrt(true_noise_var), size=bias_layer_size).to(device)
+
+                            ## add noise to both (bias) and weight layers
+                            ## bias_layer_string = f"features.{n_stack}.bias"
+
+                            self.model.state_dict()[weight_layer_string].data += weight_noise
+                            self.model.state_dict()[bias_layer_string].data += bias_noise
+                            
+                            ## after noise has been added to a layer, get the accuracy
+                            test_acc = self.get_test_accuracy()
+                            print(f"test accuracy for {weight_layer_string} = {test_acc:.2%}")
+                            
+                            ## reset model weights and biases
+                            self.model.state_dict()[weight_layer_string].data -= weight_noise
+                            self.model.state_dict()[bias_layer_string].data -= bias_noise
+
+                        test_acc_sum += test_acc
+
+                    avg_test_acc = test_acc_sum/N_NOISE_SAMPLES
+                    layer_avg_test_accs.append(avg_test_acc)
+                    print(f"Average test accuracy for {weight_layer_string} with N = {N_NOISE_SAMPLES} samples of noise at vars = {noise_var} using noise type {noise_type}: {avg_test_acc:.2%}")
+            
+                    # layer_number = (2 + int((n_stack-1)/2)) if n_stack != 0 else 1
+                    # print(f'setting layer_{layer_number}')
+
+                self.all_layer_noise_test_acc[noise_type][f'layer_{n_stack+1}'] = np.array(layer_avg_test_accs)
 
     def create_accuracy_vs_noise_plots(self):
-        df_accuracy_vs_noise = pd.DataFrame(self.all_layer_noise_test_acc)
-        df_accuracy_vs_noise = df_accuracy_vs_noise.sort_values(by='noise_vars', ascending=True)
-        print(df_accuracy_vs_noise)
-        
-        layer_cols = [col for col in df_accuracy_vs_noise.columns if "layer" in col]
-        
-        fig_noise_vs_accuracy = go.Figure()
-        for layer_col in list(layer_cols):
-            text_x = df_accuracy_vs_noise['noise_vars'].iloc[-1]
-            text_y = df_accuracy_vs_noise[layer_col].iloc[-1]
-            print(f"{layer_col}: {text_x}, {text_y}")
-            fig_noise_vs_accuracy.add_annotation(
-                xref="x",yref="y",
-                x=text_x*1.05, y=text_y, showarrow=False,
-                text=layer_col,
-            )
-            fig_noise_vs_accuracy.add_trace(
-                go.Scatter(
-                    x=df_accuracy_vs_noise['noise_vars'],
-                    y=df_accuracy_vs_noise[layer_col],
-                    mode='lines+markers',
-                    marker=dict(color=self._layer_color_map[layer_col]),
-                    name=layer_col,
-                )
-            )
-        
-        fig_noise_vs_accuracy.update_traces(mode='lines+markers', opacity=0.8) 
-        
-        if self.preloaded:
+        for noise_type in ["input_dim", "output_dim", "layer_variance"]:
+            df_accuracy_vs_noise = pd.DataFrame(self.all_layer_noise_test_acc[noise_type])
+            df_accuracy_vs_noise = df_accuracy_vs_noise.sort_values(by='noise_vars', ascending=True)
+            print(df_accuracy_vs_noise)
             
-            self.test_accuracy = self.get_test_accuracy()
+            layer_cols = [col for col in df_accuracy_vs_noise.columns if "layer" in col]
+            
+            fig_noise_vs_accuracy = go.Figure()
+            for layer_col in list(layer_cols):
+                text_x = df_accuracy_vs_noise['noise_vars'].iloc[-1]
+                text_y = df_accuracy_vs_noise[layer_col].iloc[-1]
 
-            title = f"""Preloaded CNN with test accuracy = {self.test_accuracy:.2%}
-                            <br>Noise vs Test Accuracy by layer ({self.dataset_name})"""
-        else:
-            title = f"""DNN with {self.model._N_LAYERS} layers + layer widths of {self.model._HIDDEN_LAYER_WIDTHS} with training accuracy = {self.train_accuracy:.2%}
-                            <br>Noise vs Test Accuracy by layer ({self.dataset_name}, seed = {self.noise_random_seed})"""
-        
-        fig_noise_vs_accuracy.update_layout(title=title, xaxis_title='noise vars (unscaled)', height=1200)
-        self.all_figures['noise_test_accuracies'] = fig_noise_vs_accuracy
+                print(f"{layer_col}: {text_x}, {text_y}")
 
-def run_dnn_experiments(dnn_experiments, N_EPOCHS, directory, noise_random_seed, MAX_TRAIN_ATTEMPTS=5, regularizer=None, debug=True):
-    """Convenience method to call DNN experiments with different initializations"""
+                fig_noise_vs_accuracy.add_annotation(
+                    xref="x",yref="y",
+                    x=text_x*1.05, y=text_y, showarrow=False,
+                    text=layer_col,
+                )
+                fig_noise_vs_accuracy.add_trace(
+                    go.Scatter(
+                        x=df_accuracy_vs_noise['noise_vars'],
+                        y=df_accuracy_vs_noise[layer_col],
+                        mode='lines+markers',
+                        marker=dict(color=self._layer_color_map[layer_col]),
+                        name=layer_col,
+                    )
+                )
+            
+            fig_noise_vs_accuracy.update_traces(mode='lines+markers', opacity=0.8) 
+            
+            if self.preloaded:
+                
+                self.test_accuracy = self.get_test_accuracy()
 
-    dnn_experiment_results = {}
-    for experiment_name, dnn in dnn_experiments.items():
-        print(f"Running {experiment_name}")
-        dnn_experiment = DnnLayerWeightExperiment(model=dnn, dataset_name='fashion_mnist', noise_random_seed=42, preloaded=False)
-        dnn_experiment.load_dataset()
-
-        train_attempt = 0
-        while(True):
-            if train_attempt < MAX_TRAIN_ATTEMPTS:
-                try:
-                    dnn_experiment.train_base_model(N_EPOCHS=N_EPOCHS, regularizer=regularizer) 
-                    break
-                except Exception as e:
-                    if str(e) == "Poor initialization!":
-                        train_attempt += 1
-                        new_random_seed = np.random.randint(1,100)
-                        print(f"Reinitializing weights and re-attempting training with new random seed = {new_random_seed}")
-                        dnn.initialize_weights(new_random_seed=new_random_seed)
-                        continue
-                    else:
-                        raise
+                title = f"""Preloaded CNN with test accuracy = {self.test_accuracy:.2%}
+                                <br>{noise_type} Noise vs Test Accuracy by layer ({self.dataset_name})"""
             else:
-                raise Exception("max number of train attempts exceeded!")
-        
-        dnn_experiment.get_test_accuracy()
-        dnn_experiment.create_layer_weight_plots()
+                title = f"""DNN with {self.model._N_LAYERS} layers + layer widths of {self.model._HIDDEN_LAYER_WIDTHS} with training accuracy = {self.train_accuracy:.2%}
+                                <br>{noise_type} Noise vs Test Accuracy by layer ({self.dataset_name}, seed = {self.noise_random_seed})"""
+            
+            fig_noise_vs_accuracy.update_layout(title=title, xaxis_title='noise vars (unscaled)', height=1200)
+            self.all_figures[f'{noise_type}_noise_test_accuracies'] = fig_noise_vs_accuracy
 
-        base_folder = f"{directory}/{experiment_name}/"
-        os.makedirs(base_folder, exist_ok=True)
+def run_dnn_experiments(dnn_experiments, directory, dnn_learning_rates_dict=None, N_EPOCHS=None, MAX_TRAIN_ATTEMPTS=5, regularizer=None, debug=True, noise_experiments=False, noise_vars=[]):
+    """
+    Convenience method to call DNN experiments with different initializations. 
 
-        for weight_type in ['initial_weights','final_weights']:
-            base_file_path = f"{directory}/{experiment_name}/{dnn.init_type}_init_{weight_type}_"
+    This function does one of the following: 
+    (1) calls the dnn_experiment.train_base_model method with different learning rates
+    (2) calls the dnn_experiment.create_models_with_noise method with all 3 types of noise (input layer, output layer, or variance of layer)
 
-            ## display figures regardless
-            dnn_experiment.all_figures[weight_type]['histogram'].write_html(base_file_path + "histogram.html")
-            dnn_experiment.all_figures[weight_type]['singular_values'].write_html(base_file_path + "singular_values.html")
-            dnn_experiment.all_figures[weight_type]['heatmap'].write_html(base_file_path + "heatmap.html")
+    Both of the above methods handle creation of all figures as well
+    """
 
-        dnn_experiment.all_figures['condition_numbers_by_epoch'].write_html(base_file_path + f"condition_numbers_by_epoch.html")
-        dnn_experiment.all_figures['weight_stds_by_epoch'].write_html(base_file_path + f"weight_stds_by_epoch.html")
-        dnn_experiment.all_figures['accuracies_by_epoch'].write_html(base_file_path + f"accuracies_by_epoch.html")
+    ##############
+    ## TRAINING ##
+    ##############
+    if not noise_experiments:
+        dnn_experiment_results = {}
+        for experiment_name, dnn in dnn_experiments.items():
+            print(f"Starting training for {experiment_name}...")
+            dnn_experiment = DnnLayerWeightExperiment(model=dnn, dataset_name='cifar10', noise_random_seed=42, preloaded=False)
+            dnn_experiment.load_dataset()
 
-        ## store experimental data
-        dnn_experiment_results[experiment_name] = dnn_experiment
+            train_attempt = 0
+            while(True):
+                if train_attempt < MAX_TRAIN_ATTEMPTS:
+                    try:
+                        dnn_experiment.train_base_model(N_EPOCHS=N_EPOCHS, dnn_learning_rates=dnn_learning_rates_dict[experiment_name], regularizer=regularizer) 
+                        break
+                    except Exception as e:
+                        if str(e) == "Poor initialization!":
+                            train_attempt += 1
+                            new_random_seed = np.random.randint(1,100)
+                            print(f"Reinitializing weights and re-attempting training with new random seed = {new_random_seed}")
+                            dnn.initialize_weights(new_random_seed=new_random_seed)
+                            continue
+                        else:
+                            raise
+                else:
+                    raise Exception("max number of train attempts exceeded!")
+            
+            dnn_experiment.get_test_accuracy()
+            dnn_experiment.create_layer_weight_plots()
+
+            base_folder = f"{directory}/{experiment_name}/"
+            os.makedirs(base_folder, exist_ok=True)
+
+            for weight_type in ['initial_weights','final_weights']:
+                base_file_path = f"{directory}/{experiment_name}/{weight_type}_"
+
+                ## display figures regardless
+                dnn_experiment.all_figures[weight_type]['histogram'].write_html(base_file_path + "histogram.html")
+                dnn_experiment.all_figures[weight_type]['singular_values'].write_html(base_file_path + "singular_values.html")
+                # dnn_experiment.all_figures[weight_type]['heatmap'].write_html(base_file_path + "heatmap.html")
+            
+            ## file path name for epoch based figures
+            base_file_path_epoch_figs = f"{directory}/{experiment_name}/"
+            dnn_experiment.all_figures['condition_numbers_by_epoch'].write_html(base_file_path_epoch_figs + f"condition_numbers_by_epoch.html")
+            dnn_experiment.all_figures['weight_stds_by_epoch'].write_html(base_file_path_epoch_figs + f"weight_stds_by_epoch.html")
+            dnn_experiment.all_figures['accuracies_by_epoch'].write_html(base_file_path_epoch_figs + f"accuracies_by_epoch.html")
+            dnn_experiment.all_figures['min_singular_values_by_epoch'].write_html(base_file_path_epoch_figs + f"min_singular_values_by_epoch.html")
+            dnn_experiment.all_figures['max_singular_values_by_epoch'].write_html(base_file_path_epoch_figs + f"max_singular_values_by_epoch.html")
+
+            ## store experimental data from training
+            dnn_experiment_results[experiment_name] = dnn_experiment
+        return dnn_experiment_results
     
-        ## dry_run = shorten the experiment just to see that it works
-        if debug:
-            dnn_experiment.create_models_with_noise(N_NOISE_SAMPLES=5)
-        else:
-            dnn_experiment.create_models_with_noise(N_NOISE_SAMPLES=500)
-            # torch.set_num_threads(8)
-        
-        dnn_experiment.create_accuracy_vs_noise_plots()
+    #######################
+    ## NOISE EXPERIMENTS ##
+    #######################
 
-        file_path = f"{directory}/{experiment_name}/{dnn.init_type}_init_noise_experiments.html"
+    if noise_experiments:
+        for experiment_name, dnn_experiment in dnn_experiments.items():
+            print(f"Running layer noise experiments for {experiment_name}...")
+            if debug:
+                dnn_experiment.create_models_with_noise(N_NOISE_SAMPLES=2, noise_vars=noise_vars)
+            else:
+                dnn_experiment.create_models_with_noise(N_NOISE_SAMPLES=100, noise_vars=noise_vars)
+            
+            dnn_experiment.create_accuracy_vs_noise_plots()
 
-        dnn_experiment.all_figures['noise_test_accuracies'].write_html(file_path)
-
-    return dnn_experiment_results
+            ## save the figures
+            for k,v in dnn_experiment.all_figures.items():
+                if '_noise_test_accuracies' in k:
+                    file_path = f"{directory}/{experiment_name}/{k}_noise_experiments.html"
+                    dnn_experiment.all_figures[k].write_html(file_path)
+        return None
 
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Run DNN and weight noise experiments")
     parser.add_argument("--experiment-version", type=str, help="Experiment version number for creating folders to hold results, should be a string of the form v1, v2...", required=True)
-    parser.add_argument("--experiment-type", type=str, help="Train a DNN or use a pre-loaded CNN", choices=["DNN", "dnn", "CNN", "cnn"], required=True)
+    parser.add_argument("--experiment-type", type=str, help="Train a DNN, load a saved DNN, or load a pretrained CNN", choices=["dnn-train", "dnn-load-model", "cnn"], required=True)
+    parser.add_argument("--learning-rates-dict", help="Pass a dictionary of learning rates for each dnn experiment", required=False)
+    parser.add_argument("--pretrained-model-name", type=str, help="File name of pretrained DNN/CNN (stored as .pth)", required=False)
+    parser.add_argument("--noise-vars", help="Pass a list of non-normalized noise variances that are added to a model", required=False)
     parser.add_argument("--cloud-environment", type=str, help="Local or Tufts HPC", choices=["local","hpc"], required=True)
     parser.add_argument("--debug-mode", type=str, help="Debug Mode or actual experiment", choices=["debug","experiment"], required=True)
     args = parser.parse_args()
@@ -1029,9 +1117,13 @@ if __name__ == "__main__":
     cloud_environment = args.cloud_environment
     debug = True if args.debug_mode == "debug" else False
     if debug:
-        N_EPOCHS = 100
+        N_EPOCHS = 10
     else:
-        N_EPOCHS = 400
+        print(torch.__version__)
+        print(torch.cuda.is_available())
+        print(torch.cuda.device_count())
+
+        N_EPOCHS = 40
 
     ## if using the cluster, automatically create a new directory, no user input
     if cloud_environment == 'hpc':
@@ -1047,23 +1139,7 @@ if __name__ == "__main__":
             os.makedirs(directory, exist_ok=True)
     
     experiment_type = args.experiment_type
-    if experiment_type.upper() == 'DNN':
-    
-        # print("----- Running all DNN experiments -----")
-
-        # start = time.time()
-        # random_seed = 43
-
-        # ## adjust the DNN hidden layer dimensions as needed
-        # dnn1 = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[64, 64, 64, 64], random_seed=random_seed, init_type="normal")
-        # dnn2 = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[128, 128, 128, 128], random_seed=random_seed, init_type="normal")
-        # dnn3 = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[128, 128, 128, 128, 128, 128, 128], random_seed=random_seed, init_type="normal")
-
-        # dnn_experiments = {
-        #     'dnn1': dnn1,
-        #     'dnn2': dnn2,
-        #     'dnn3': dnn3
-        # }
+    if experiment_type.upper() == 'DNN-TRAIN':
 
         ## for debugging, set N_EPOCHS = 10
         ## when running the job, set N_EPOCHS = 200 or more
@@ -1074,12 +1150,61 @@ if __name__ == "__main__":
 
         random_seed = 42
         noise_random_seed = 42
-        # dnn1 = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[128, 128, 128, 128, 128, 128, 128], random_seed=random_seed, init_type="normal")
-        dnn2 = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[256, 256, 256, 256, 256, 256, 256], random_seed=random_seed, init_type="normal")
-        dnn_experiments = {
-            'dnn2': dnn2,
-        }
-        dnn_experiments_results = run_dnn_experiments(dnn_experiments, N_EPOCHS=N_EPOCHS, noise_random_seed=42, directory=directory, MAX_TRAIN_ATTEMPTS=5, regularizer="l2", debug=debug)
+
+        if debug:
+            dnn2biii = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[256, 256, 256, 256, 256, 256, 256], random_seed=random_seed, init_type="normal")
+            dnn_experiments = {
+                'dnn2biii': dnn2biii,
+            }
+            # HPC isn't working...
+            
+        else:
+            ## v27
+            # dnn2a = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[256, 256, 256, 256, 256, 256, 256], random_seed=random_seed, init_type="normal")
+            # dnn2bi = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 1024, 1024, 1024, 1024, 1024, 1024], random_seed=random_seed, init_type="normal")
+            # dnn_experiments = {
+            #     'dnn2a': dnn2a,
+            #     'dnn2bi': dnn2bi,
+            # }
+
+            ## v28
+            # dnn2bii = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[512, 512, 512, 512, 512, 512, 512], random_seed=random_seed, init_type="normal")
+            # dnn_experiments = {
+            #     'dnn2bii': dnn2bii,
+            # }
+
+            ## v29
+            # dnn2biii = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[4096, 4096, 4096, 4096, 4096, 4096, 4096], random_seed=random_seed, init_type="normal")
+            # dnn_experiments = {
+            #     'dnn2biii': dnn2biii,
+            # }
+
+            ## v30
+            # dnn2a = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[256, 256, 256, 256, 256, 256, 256], random_seed=random_seed, init_type="normal")
+            # dnn_experiments = {
+            #     'dnn2a': dnn2a
+            # }
+
+            ## v36
+            dnn2d = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[512, 512, 512, 512, 512, 512, 512], random_seed=random_seed, init_type="normal")
+            dnn2e = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 1024, 1024, 1024, 1024, 1024, 1024], random_seed=random_seed, init_type="uniform")
+            dnn2f = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 1024, 1024, 1024, 1024, 1024, 1024], random_seed=random_seed, init_type="normal")
+            dnn_experiments = {
+                'dnn2d': dnn2d,
+                'dnn2e': dnn2e,
+                'dnn2f': dnn2f,
+            }
+            
+        dnn_learning_rates_dict = eval(args.learning_rates_dict)
+        dnn_experiments_results = run_dnn_experiments(
+            dnn_experiments, 
+            directory=directory, 
+            dnn_learning_rates_dict=dnn_learning_rates_dict, 
+            N_EPOCHS=N_EPOCHS, 
+            MAX_TRAIN_ATTEMPTS=5, 
+            regularizer=None, 
+            debug=debug
+        )
         
         ## save dnn_experiments_results using torch
         torch.save(dnn_experiments_results, f'{directory}/dnn_experiments_results.pth')
@@ -1087,6 +1212,30 @@ if __name__ == "__main__":
         end = time.time()
         runtime = (end - start) / 60
         print(f"Total runtime = {runtime:.2f} minutes")
+    
+    if experiment_type.upper() == 'DNN-LOAD-MODEL':
+        model_name = args.pretrained_model_name
+        full_model_path = directory + '/' + model_name
+        dnn_experiments = torch.load(full_model_path, weights_only=False)
+        # {
+        #     'dnn1': trained_dnn1,
+        #     'dnn2': trained_dnn2
+        # }
+
+        noise_vars = eval(args.noise_vars)
+
+        ## call the noise layer weight experiments on all models
+        run_dnn_experiments(
+            dnn_experiments=dnn_experiments, 
+            directory=directory, 
+            dnn_learning_rates_dict={}, 
+            N_EPOCHS=None, 
+            MAX_TRAIN_ATTEMPTS=None, 
+            regularizer=None, 
+            debug=debug,
+            noise_experiments=True,
+            noise_vars=noise_vars
+        )
 
     ## pretrained CNN + CIFAR-10
     if experiment_type.upper() == 'CNN':
