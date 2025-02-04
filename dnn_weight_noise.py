@@ -289,7 +289,6 @@ class DnnLayerWeightExperiment():
             # optimizer = optim.SGD(self.model.parameters(), lr=lr, momentum=0.9, weight_decay=l2_lambda, nesterov=True)
             optimizer = optim.Adam(self.model.parameters(), lr=lr)
             scheduler = ReduceLROnPlateau(optimizer, 'min', patience=10, factor=0.75)
-            
 
             for epoch in range(N_EPOCHS):
 
@@ -837,7 +836,7 @@ class DnnLayerWeightExperiment():
     #####  EXPERIMENT 2: freeze layers and then add noise  #####
     ############################################################
 
-    def create_models_with_noise(self, N_NOISE_SAMPLES=10, noise_vars=[0.1, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]):
+    def create_models_with_noise(self, N_NOISE_SAMPLES=10, noise_vars=[0.1, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0], noise_types=["input_dim","output_dim","layer_variance"]):
         
         np.random.seed(self.noise_random_seed)
         device = next(self.model.parameters()).device
@@ -854,7 +853,7 @@ class DnnLayerWeightExperiment():
         #     ...
         
         if not self.preloaded:
-            for noise_type in ["input_dim","output_dim","layer_variance"]:
+            for noise_type in noise_types:
                 self.all_layer_noise_test_acc[noise_type]["noise_vars"] = noise_vars
             n_stack_layers = [int(''.join(filter(str.isdigit, layer))) for layer in self.model.state_dict() if (("weight" in layer) and ("classifier" not in layer))]
             print(n_stack_layers)
@@ -869,7 +868,7 @@ class DnnLayerWeightExperiment():
             # noise_vars = [0.1, 0.4, 0.7, 1.0, 1.4, 1.7, 2.0]
 
             ## store the noise vars to be plotted (true noise vars may be scaled)
-            for noise_type in ["input_dim","output_dim","layer_variance"]:
+            for noise_type in noise_types:
                 self.all_layer_noise_test_acc[noise_type]["noise_vars"] = noise_vars
             self.all_layer_noise_test_acc["noise_vars"] = noise_vars
             
@@ -894,10 +893,11 @@ class DnnLayerWeightExperiment():
 
                 print(f"layer {weight_layer_string} as shape {layer_weights.shape}")
 
-        for n_stack in n_stack_layers:
+        for n, n_stack in enumerate(n_stack_layers):
             ## for a particular layer (n_stack), keep track of the test_accuracy vs noise
-            
-            for noise_type in ["input_dim","output_dim","layer_variance"]:
+            ## for figures and layers, we use n to refer to layer 1, ... layer N of the DNN
+        
+            for noise_type in noise_types:
                 layer_avg_test_accs = []
                 
                 for noise_var in noise_vars: 
@@ -907,14 +907,14 @@ class DnnLayerWeightExperiment():
                     ## layer weights have dimension (output_dim, input_dim)
                     if not self.preloaded:
                         if noise_type == "input_dim":
-                            layer_width = self.model_layer_info[f"layer_{n_stack+1}"]["final_weights"].shape[1]
+                            layer_width = self.model_layer_info[f"layer_{n+1}"]["final_weights"].shape[1]
                             true_noise_var =  noise_var / layer_width
                         elif noise_type == "output_dim":
-                            layer_width = self.model_layer_info[f"layer_{n_stack+1}"]["final_weights"].shape[0]
+                            layer_width = self.model_layer_info[f"layer_{n+1}"]["final_weights"].shape[0]
                             true_noise_var =  noise_var / layer_width
                         elif noise_type == "layer_variance":
-                            weight_layer_stdev = self.model_layer_info[f"layer_{n_stack+1}"]["weight_std_by_epoch"][-1]
-                            true_noise_var =  weight_layer_stdev**2 * noise_var / layer_width
+                            weight_layer_stdev = self.model_layer_info[f"layer_{n+1}"]["weight_std_by_epoch"][-1]
+                            true_noise_var =  weight_layer_stdev**2 * noise_var
                     
                     if self.preloaded:
                         true_noise_var = noise_var
@@ -966,10 +966,10 @@ class DnnLayerWeightExperiment():
                     # layer_number = (2 + int((n_stack-1)/2)) if n_stack != 0 else 1
                     # print(f'setting layer_{layer_number}')
 
-                self.all_layer_noise_test_acc[noise_type][f'layer_{n_stack+1}'] = np.array(layer_avg_test_accs)
+                self.all_layer_noise_test_acc[noise_type][f'layer_{n+1}'] = np.array(layer_avg_test_accs)
 
-    def create_accuracy_vs_noise_plots(self):
-        for noise_type in ["input_dim", "output_dim", "layer_variance"]:
+    def create_accuracy_vs_noise_plots(self, noise_types):
+        for noise_type in noise_types:
             df_accuracy_vs_noise = pd.DataFrame(self.all_layer_noise_test_acc[noise_type])
             df_accuracy_vs_noise = df_accuracy_vs_noise.sort_values(by='noise_vars', ascending=True)
             print(df_accuracy_vs_noise)
@@ -1013,7 +1013,18 @@ class DnnLayerWeightExperiment():
             fig_noise_vs_accuracy.update_layout(title=title, xaxis_title='noise vars (unscaled)', height=1200)
             self.all_figures[f'{noise_type}_noise_test_accuracies'] = fig_noise_vs_accuracy
 
-def run_dnn_experiments(dnn_experiments, directory, dnn_learning_rates_dict=None, N_EPOCHS=None, MAX_TRAIN_ATTEMPTS=5, regularizer=None, debug=True, noise_experiments=False, noise_vars=[]):
+def run_dnn_experiments(
+    dnn_experiments, 
+    directory, 
+    dnn_learning_rates_dict=None, 
+    N_EPOCHS=None, 
+    MAX_TRAIN_ATTEMPTS=5, 
+    regularizer=None, 
+    debug=True, 
+    noise_experiments=False, 
+    noise_vars=[], 
+    noise_types=["input_dim","output_dim","layer_variance"]
+):
     """
     Convenience method to call DNN experiments with different initializations. 
 
@@ -1086,11 +1097,11 @@ def run_dnn_experiments(dnn_experiments, directory, dnn_learning_rates_dict=None
         for experiment_name, dnn_experiment in dnn_experiments.items():
             print(f"Running layer noise experiments for {experiment_name}...")
             if debug:
-                dnn_experiment.create_models_with_noise(N_NOISE_SAMPLES=2, noise_vars=noise_vars)
+                dnn_experiment.create_models_with_noise(N_NOISE_SAMPLES=2, noise_vars=noise_vars, noise_types=noise_types)
             else:
-                dnn_experiment.create_models_with_noise(N_NOISE_SAMPLES=100, noise_vars=noise_vars)
+                dnn_experiment.create_models_with_noise(N_NOISE_SAMPLES=100, noise_vars=noise_vars, noise_types=noise_types)
             
-            dnn_experiment.create_accuracy_vs_noise_plots()
+            dnn_experiment.create_accuracy_vs_noise_plots(noise_types=noise_types)
 
             ## save the figures
             for k,v in dnn_experiment.all_figures.items():
@@ -1107,6 +1118,7 @@ if __name__ == "__main__":
     parser.add_argument("--learning-rates-dict", help="Pass a dictionary of learning rates for each dnn experiment", required=False)
     parser.add_argument("--pretrained-model-name", type=str, help="File name of pretrained DNN/CNN (stored as .pth)", required=False)
     parser.add_argument("--noise-vars", help="Pass a list of non-normalized noise variances that are added to a model", required=False)
+    parser.add_argument("--noise-type", help="Pass a noise type or generate figures for all possible types of noise", choices=["input_dim","output_dim","layer_variance","all"], default="all", required=False)
     parser.add_argument("--cloud-environment", type=str, help="Local or Tufts HPC", choices=["local","hpc"], required=True)
     parser.add_argument("--debug-mode", type=str, help="Debug Mode or actual experiment", choices=["debug","experiment"], required=True)
     args = parser.parse_args()
@@ -1159,40 +1171,40 @@ if __name__ == "__main__":
             # HPC isn't working...
             
         else:
-            ## v27
+            ## v35
             # dnn2a = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[256, 256, 256, 256, 256, 256, 256], random_seed=random_seed, init_type="normal")
-            # dnn2bi = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 1024, 1024, 1024, 1024, 1024, 1024], random_seed=random_seed, init_type="normal")
+            # dnn2b = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[256, 256, 256, 256, 256, 256, 256], random_seed=random_seed, init_type="uniform")
+            # dnn2c = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[512, 512, 512, 512, 512, 512, 512], random_seed=random_seed, init_type="normal")
             # dnn_experiments = {
             #     'dnn2a': dnn2a,
-            #     'dnn2bi': dnn2bi,
-            # }
-
-            ## v28
-            # dnn2bii = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[512, 512, 512, 512, 512, 512, 512], random_seed=random_seed, init_type="normal")
-            # dnn_experiments = {
-            #     'dnn2bii': dnn2bii,
-            # }
-
-            ## v29
-            # dnn2biii = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[4096, 4096, 4096, 4096, 4096, 4096, 4096], random_seed=random_seed, init_type="normal")
-            # dnn_experiments = {
-            #     'dnn2biii': dnn2biii,
-            # }
-
-            ## v30
-            # dnn2a = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[256, 256, 256, 256, 256, 256, 256], random_seed=random_seed, init_type="normal")
-            # dnn_experiments = {
-            #     'dnn2a': dnn2a
+            #     'dnn2b': dnn2b,
+            #     'dnn2c': dnn2c,
             # }
 
             ## v36
-            dnn2d = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[512, 512, 512, 512, 512, 512, 512], random_seed=random_seed, init_type="normal")
-            dnn2e = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 1024, 1024, 1024, 1024, 1024, 1024], random_seed=random_seed, init_type="uniform")
-            dnn2f = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 1024, 1024, 1024, 1024, 1024, 1024], random_seed=random_seed, init_type="normal")
+            # dnn2d = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[512, 512, 512, 512, 512, 512, 512], random_seed=random_seed, init_type="normal")
+            # dnn2e = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 1024, 1024, 1024, 1024, 1024, 1024], random_seed=random_seed, init_type="uniform")
+            # dnn2f = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 1024, 1024, 1024, 1024, 1024, 1024], random_seed=random_seed, init_type="normal")
+            # dnn_experiments = {
+            #     'dnn2d': dnn2d,
+            #     'dnn2e': dnn2e,
+            #     'dnn2f': dnn2f,
+            # }
+
+            ## v37
+            # dnn2g = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[4096, 4096, 4096, 4096, 4096, 4096, 4096], random_seed=random_seed, init_type="uniform")
+            # dnn2h = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[4096, 4096, 4096, 4096, 4096, 4096, 4096], random_seed=random_seed, init_type="normal")
+            # dnn_experiments = {
+            #     'dnn2g': dnn2g,
+            #     'dnn2h': dnn2h,
+            # }
+
+            ## v38
+            dnn2i = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 768, 512, 384, 256, 192, 128, 96], random_seed=random_seed, init_type="uniform")
+            dnn2j = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 768, 512, 384, 256, 192, 128, 96], random_seed=random_seed, init_type="normal")
             dnn_experiments = {
-                'dnn2d': dnn2d,
-                'dnn2e': dnn2e,
-                'dnn2f': dnn2f,
+                'dnn2i': dnn2i,
+                'dnn2j': dnn2j,
             }
             
         dnn_learning_rates_dict = eval(args.learning_rates_dict)
@@ -1223,6 +1235,11 @@ if __name__ == "__main__":
         # }
 
         noise_vars = eval(args.noise_vars)
+        noise_type = args.noise_type
+        if noise_type == "all":
+            noise_types = ["input_dim","output_dim","layer_variance"]
+        else:
+            noise_types = [noise_type]
 
         ## call the noise layer weight experiments on all models
         run_dnn_experiments(
@@ -1234,7 +1251,8 @@ if __name__ == "__main__":
             regularizer=None, 
             debug=debug,
             noise_experiments=True,
-            noise_vars=noise_vars
+            noise_vars=noise_vars,
+            noise_types=noise_types,
         )
 
     ## pretrained CNN + CIFAR-10
