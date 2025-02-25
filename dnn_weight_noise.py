@@ -1,6 +1,5 @@
 import argparse
 import copy
-import json
 import os
 import time
 import numpy as np
@@ -19,11 +18,7 @@ from plotly.subplots import make_subplots
 import plotly.graph_objects as go
 import plotly.express as px
 
-from utils import fit_gaussian_curve, init_weights, equalize_axes_layout
-
-# from cifar10_models.vgg import vgg11_bn, vgg13_bn, vgg16_bn, vgg19_bn
-
-# from torchvision.models import vgg16
+from utils import fit_gaussian_curve, init_weights
 
 # print(torch.__version__)
 # print(torch.cuda.is_available())
@@ -31,7 +26,7 @@ from utils import fit_gaussian_curve, init_weights, equalize_axes_layout
 device = ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 
 class DNN(nn.Module):
-    def __init__(self, N_CLASSES, HIDDEN_LAYER_WIDTHS, random_seed, init_type):
+    def __init__(self, N_CLASSES, HIDDEN_LAYER_WIDTHS, random_seed, init_type, normalization_type):
         super().__init__()
         self._N_CLASSES = N_CLASSES
 
@@ -41,6 +36,7 @@ class DNN(nn.Module):
 
         self.random_seed = random_seed
         self.init_type = init_type
+        self.normalization_type = normalization_type
 
         if device=="mps":
             torch.mps.manual_seed(self.random_seed)
@@ -58,6 +54,14 @@ class DNN(nn.Module):
                 previous_layer_width = self._HIDDEN_LAYER_WIDTHS[i-1]
                 hidden_layers.append(nn.Linear(previous_layer_width, layer_width))
             
+            ## add batch norm layer
+            if normalization_type.upper() == 'BATCH':
+                hidden_layers.append(nn.BatchNorm1d(num_features=layer_width))
+            elif normalization_type is None:
+                pass
+            else:
+                raise Exception(f"Normalization of type {normalization_type} not yet implemented or supported!")
+
             ## add RELU activation layer
             hidden_layers.append(nn.ReLU())
         output_layer = [nn.Linear(self._HIDDEN_LAYER_WIDTHS[-1], self._N_CLASSES)]
@@ -100,6 +104,7 @@ class DnnLayerWeightExperiment():
         self.max_weights_std = None
 
         self.preloaded = preloaded
+        self.model_layer_info = {}
 
         ## guarantee the same color scheme across plots for readability
         if not self.preloaded:
@@ -112,34 +117,34 @@ class DnnLayerWeightExperiment():
             ## initialize it later
             self._color_palette = px.colors.qualitative.Dark24
             self._layer_color_map = {}
+            
+        n = 1
+        for name, module in self.model.named_modules():
+            ## weights come before biases
 
-        if self.preloaded:
-            self.model_layer_info = {}
-        
-        else:
-            self.model_layer_info = {
-                f'layer_{i}': {
-                    'initial_weights': None,
-                    'initial_biases': None,
-                    'final_weights': None,
-                    'final_biases': None,
-                    'weight_std_by_epoch': [],
-                    'cond_number_by_epoch': [],
-                    'min_singular_value_by_epoch': [],
-                    'max_singular_value_by_epoch': [],
-                } for i in range(1,self.model._N_LAYERS+1)
-            }
+            print(f"layer name: {name} of type {type(module)}")
 
-            n = 1
-            for name, layer in self.model.named_parameters():
-                if 'weight' in name:
-                    self.model_layer_info[f'layer_{n}']['initial_weights'] = layer.detach().cpu().numpy()
-                
-                ## weights come before biases
-                if 'bias' in name:
-                    self.model_layer_info[f'layer_{n}']['initial_biases'] = layer.detach().cpu().numpy()
+            if isinstance(module, nn.modules.linear.Linear):
+                print(f"found linear layer for n = {n}")
+                if self.model_layer_info.get(f'layer_{n}') is None:
+                    self.model_layer_info[f'layer_{n}'] = {
+                        'initial_weights': None,
+                        'initial_biases': None,
+                        'final_weights': None,
+                        'final_biases': None,
+                        'weight_std_by_epoch': [],
+                        'cond_number_by_epoch': [],
+                        'min_singular_value_by_epoch': [],
+                        'max_singular_value_by_epoch': [],
+                    }
+                    self.model_layer_info[f'layer_{n}']['initial_weights'] = module.weight.data.clone().numpy()
+                    self.model_layer_info[f'layer_{n}']['initial_biases'] = module.bias.data.clone().numpy()
+                    print(self.model_layer_info[f'layer_{n}']['initial_weights'].shape)
+                    print(self.model_layer_info[f'layer_{n}']['initial_biases'].shape)
                     n += 1
-            n = 1
+                else:
+                    pass
+        n = 1
 
         # model output instance attributes
         self.train_accuracies = []
@@ -169,6 +174,9 @@ class DnnLayerWeightExperiment():
     
     # Define the transformations for the data
     # Create the dataloaders for train, validation, and test
+
+    # def get_base_model(self):
+    #     return self.base_model
 
     def load_dataset(self):
         # Download and load the training, validation, and test datasets
@@ -222,16 +230,16 @@ class DnnLayerWeightExperiment():
             raise Exception("Dataset {self.dataset_name} not supported")
         
         ## create DataLoaders
-        trainloader = torch.utils.data.DataLoader(self.train_data, batch_size=128, shuffle=True, num_workers=2)
-        valloader = torch.utils.data.DataLoader(self.val_data, batch_size=128, shuffle=False, pin_memory=True)
-        testloader = torch.utils.data.DataLoader(self.test_data, batch_size=128, shuffle=True, num_workers=2)
+        trainloader = DataLoader(self.train_data, batch_size=128, shuffle=True, num_workers=2)
+        valloader = DataLoader(self.val_data, batch_size=128, shuffle=False, pin_memory=True)
+        testloader = DataLoader(self.test_data, batch_size=128, shuffle=True, num_workers=2)
         self.dataloaders = {
             'train': trainloader,
             'validation': valloader,
             'test': testloader
         }
 
-    def train_base_model(self, N_EPOCHS=30, dnn_learning_rates=[], regularizer=None):
+    def train_base_model(self, N_EPOCHS=30, dnn_learning_rates=[], regularizer=None, add_diagonal_matrix=False):
 
         self._N_EPOCHS = N_EPOCHS
         
@@ -242,14 +250,15 @@ class DnnLayerWeightExperiment():
         ## OR we can implement it out-of-the-box (this is useful if we intend to modify it)
         ## construct l2_norm one layer at a time for future use
         
-        l2_lambda = 10**-5
+        # l2_lambda = 10**-5
+
         l2_loss = torch.tensor(0.)
         loss_function = nn.CrossEntropyLoss()
 
         if regularizer == 'l2':
-            for name, layer in self.model.named_parameters():
-                if 'weight' in name:
-                    l2_loss = l2_loss + torch.linalg.norm(layer, 2).detach() ** 2
+            for name, module in self.model.named_modules():
+                if isinstance(module, nn.modules.linear.Linear):
+                    l2_loss = l2_loss + torch.linalg.norm(module.weight, 2).detach() ** 2
         elif regularizer is None:
             pass
         else:
@@ -288,7 +297,7 @@ class DnnLayerWeightExperiment():
 
             # optimizer = optim.SGD(self.model.parameters(), lr=lr, momentum=0.9, weight_decay=l2_lambda, nesterov=True)
             optimizer = optim.Adam(self.model.parameters(), lr=lr)
-            scheduler = ReduceLROnPlateau(optimizer, 'min', patience=10, factor=0.75)
+            scheduler = ReduceLROnPlateau(optimizer, 'min', patience=10, factor=0.2)
 
             for epoch in range(N_EPOCHS):
 
@@ -323,6 +332,22 @@ class DnnLayerWeightExperiment():
 
                     loss.backward()
                     optimizer.step()
+
+                    ## after the optimizer step happens, we can make small changes to weights
+                        ## such as adding a small diagonal matrix
+                    if add_diagonal_matrix:
+
+                        # Add small diagonal matrix to weights
+                        beta = 0.9**epoch
+                        delta = 1e-2
+                        for name, module in self.model.named_modules():
+                            if isinstance(module, nn.modules.linear.Linear):
+                                with torch.no_grad():
+                                    weight_shape = module.weight.data.shape
+                                    if weight_shape[0] == weight_shape[1]:
+                                        diag_matrix = beta * delta * torch.eye(weight_shape[0], device=device)
+                                        module.weight.data += diag_matrix
+
                     train_loss += loss.item()
 
                 train_accuracy = train_correct / train_total
@@ -356,11 +381,14 @@ class DnnLayerWeightExperiment():
                 ## for each epoch, we need to get layer weight std and condition number
 
                 n = 1
-                for name, layer in self.model.named_parameters():
-                    if "weight" in name:
+                
+                for name, module in self.model.named_modules():
+                    if isinstance(module, nn.modules.linear.Linear):
                         # print(f"saving layer n = {n}")
-                        layer_weights = layer.detach().cpu().numpy()
-                        # print(layer_weights.shape)
+                        layer_weights = module.weight.data.clone().numpy()
+                        
+                        print(f"layer {n} has shape {layer_weights.shape}")
+
                         try:
                             cond_number = np.linalg.cond(layer_weights)
                             if np.isnan(cond_number):
@@ -401,27 +429,17 @@ class DnnLayerWeightExperiment():
             else:
                 print(f"Training successfully converged for (starting) learning rate = {lr}")
 
-                ## when we improve on the current best test accuracy
-                ## we set all of the model parameters equal the current state of the model
-
-                ## NOTE: this could happen mid-experiment, so the model state will be reset
-                ## when subsequent learning rates are tried
-
                 if (test_accuracy > best_test_accuracy):
                     print(f"Better test accuracy = {test_accuracy} found for learning rate {lr}, overwriting model")
                     self.best_lr = lr
                     best_test_accuracy = test_accuracy # primitives are immutable! if test_accuracy changes, won't impact best_test_accuracy
                     best_model_state = copy.deepcopy(self.model.state_dict())
 
-                    # print("setting self.model_layer_info to model_layer_info (shown below)")
                     self.model_layer_info = copy.deepcopy(model_layer_info)
                     self.train_accuracy = train_accuracy # saves train accuracy corresponding to best test accuracy
                     self.train_accuracies = train_accuracies
                     self.test_accuracy = test_accuracy
                     self.test_accuracies = test_accuracies
-                
-            ## reset accuracies for the next iteration of learning parameter + optimizer
-            ## we need to reset the model too!
 
             print("--- Resetting model experiment parameters! ---")
             train_accuracies = []
@@ -455,17 +473,19 @@ class DnnLayerWeightExperiment():
         ## these can be accessed later for data visualization, debugging, and analysis
         
         n = 1
-        for name, layer in self.model.named_parameters():
-            print(name)
-            if 'weight' in name:
-                layer_weights = layer.detach().cpu().numpy()
+        for name, module in self.model.named_modules():
+            ## weights come before biases
+
+            print(f"layer name: {name} of type {type(module)}")
+
+            if isinstance(module, nn.modules.linear.Linear):
+                layer_weights = module.weight.data.clone().numpy()
                 print(f"setting layer {n} final weights to weights from {name}")
                 self.model_layer_info[f'layer_{n}']['final_weights'] = layer_weights
         
-            ## weights come before biases
-            if 'bias' in name:
+                layer_biases = module.bias.data.clone().numpy()
                 print(f"setting bias {n} final weights to biases from {name}")
-                self.model_layer_info[f'layer_{n}']['final_biases'] = layer_weights
+                self.model_layer_info[f'layer_{n}']['final_biases'] = layer_biases
 
                 ## since there will always be a bias corresponding to weight, only increment after bias
                 n += 1
@@ -891,7 +911,7 @@ class DnnLayerWeightExperiment():
                 ## setting color scheme for each layer
                 self._layer_color_map[f"layer_{n_stack+1}"] = self._color_palette[i-1]
 
-                print(f"layer {weight_layer_string} as shape {layer_weights.shape}")
+                print(f"layer {weight_layer_string} has shape {layer_weights.shape}")
 
         for n, n_stack in enumerate(n_stack_layers):
             ## for a particular layer (n_stack), keep track of the test_accuracy vs noise
@@ -1020,10 +1040,11 @@ def run_dnn_experiments(
     N_EPOCHS=None, 
     MAX_TRAIN_ATTEMPTS=5, 
     regularizer=None, 
+    add_diagonal_matrix=False,
     debug=True, 
     noise_experiments=False, 
     noise_vars=[], 
-    noise_types=["input_dim","output_dim","layer_variance"]
+    noise_types=["input_dim","output_dim","layer_variance"],
 ):
     """
     Convenience method to call DNN experiments with different initializations. 
@@ -1049,7 +1070,7 @@ def run_dnn_experiments(
             while(True):
                 if train_attempt < MAX_TRAIN_ATTEMPTS:
                     try:
-                        dnn_experiment.train_base_model(N_EPOCHS=N_EPOCHS, dnn_learning_rates=dnn_learning_rates_dict[experiment_name], regularizer=regularizer) 
+                        dnn_experiment.train_base_model(N_EPOCHS=N_EPOCHS, dnn_learning_rates=dnn_learning_rates_dict[experiment_name], regularizer=regularizer, add_diagonal_matrix=add_diagonal_matrix) 
                         break
                     except Exception as e:
                         if str(e) == "Poor initialization!":
@@ -1121,6 +1142,8 @@ if __name__ == "__main__":
     parser.add_argument("--noise-type", help="Pass a noise type or generate figures for all possible types of noise", choices=["input_dim","output_dim","layer_variance","all"], default="all", required=False)
     parser.add_argument("--cloud-environment", type=str, help="Local or Tufts HPC", choices=["local","hpc"], required=True)
     parser.add_argument("--debug-mode", type=str, help="Debug Mode or actual experiment", choices=["debug","experiment"], required=True)
+    parser.add_argument("--add-diagonal-matrix", type=str, help="Add small diagonal matrix to weights during training", default="false")
+    parser.add_argument("--normalization-type", type=str, help="Add normalization before RELU during training", choices=["batch","layer","weight","none"], required=True)
     args = parser.parse_args()
 
     version = args.experiment_version
@@ -1129,13 +1152,13 @@ if __name__ == "__main__":
     cloud_environment = args.cloud_environment
     debug = True if args.debug_mode == "debug" else False
     if debug:
-        N_EPOCHS = 10
+        N_EPOCHS = 20
     else:
         print(torch.__version__)
         print(torch.cuda.is_available())
         print(torch.cuda.device_count())
 
-        N_EPOCHS = 40
+        N_EPOCHS = 50
 
     ## if using the cluster, automatically create a new directory, no user input
     if cloud_environment == 'hpc':
@@ -1151,6 +1174,8 @@ if __name__ == "__main__":
             os.makedirs(directory, exist_ok=True)
     
     experiment_type = args.experiment_type
+    add_diagonal_matrix = True if args.add_diagonal_matrix.upper() == 'TRUE' else False
+    normalization_type = args.normalization_type
     if experiment_type.upper() == 'DNN-TRAIN':
 
         ## for debugging, set N_EPOCHS = 10
@@ -1164,11 +1189,10 @@ if __name__ == "__main__":
         noise_random_seed = 42
 
         if debug:
-            dnn2biii = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[256, 256, 256, 256, 256, 256, 256], random_seed=random_seed, init_type="normal")
+            dnn2k = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 512, 256, 128], random_seed=random_seed, init_type="uniform", normalization_type=normalization_type)
             dnn_experiments = {
-                'dnn2biii': dnn2biii,
+                'dnn2k': dnn2k
             }
-            # HPC isn't working...
             
         else:
             ## v35
@@ -1182,11 +1206,9 @@ if __name__ == "__main__":
             # }
 
             ## v36
-            # dnn2d = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[512, 512, 512, 512, 512, 512, 512], random_seed=random_seed, init_type="normal")
             # dnn2e = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 1024, 1024, 1024, 1024, 1024, 1024], random_seed=random_seed, init_type="uniform")
             # dnn2f = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 1024, 1024, 1024, 1024, 1024, 1024], random_seed=random_seed, init_type="normal")
             # dnn_experiments = {
-            #     'dnn2d': dnn2d,
             #     'dnn2e': dnn2e,
             #     'dnn2f': dnn2f,
             # }
@@ -1198,13 +1220,55 @@ if __name__ == "__main__":
             #     'dnn2g': dnn2g,
             #     'dnn2h': dnn2h,
             # }
+            # dnn2h = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[4096, 4096, 4096, 4096, 4096, 4096, 4096], random_seed=random_seed, init_type="normal")
+            # dnn_experiments = {
+            #     'dnn2h': dnn2h,
+            # }
 
             ## v38
-            dnn2i = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 768, 512, 384, 256, 192, 128, 96], random_seed=random_seed, init_type="uniform")
-            dnn2j = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 768, 512, 384, 256, 192, 128, 96], random_seed=random_seed, init_type="normal")
+            # dnn2i = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 768, 512, 384, 256, 192, 128, 96], random_seed=random_seed, init_type="uniform")
+            # dnn2j = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 768, 512, 384, 256, 192, 128, 96], random_seed=random_seed, init_type="normal")
+            # dnn_experiments = {
+            #     'dnn2i': dnn2i,
+            #     'dnn2j': dnn2j,
+            # }
+
+            ## v39
+            # dnn1a = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 1024, 1024], random_seed=random_seed, init_type="uniform")
+            # dnn1b = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 1024, 1024], random_seed=random_seed, init_type="normal")
+            # dnn1c = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[2048, 2048, 2048], random_seed=random_seed, init_type="uniform")
+            # dnn1d = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[2048, 2048, 2048], random_seed=random_seed, init_type="normal")
+            # dnn_experiments = {
+            #     'dnn1a': dnn1a,
+            #     'dnn1b': dnn1b,
+            #     'dnn1c': dnn1c,
+            #     'dnn1d': dnn1d,
+            # }
+
+            # dnn1e = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 512, 256], random_seed=random_seed, init_type="uniform")
+            # dnn1f = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 512, 256], random_seed=random_seed, init_type="normal")
+            # dnn_experiments = {
+            #     'dnn1e': dnn1e,
+            #     'dnn1f': dnn1f,
+            # }
+
+            # dnn1h = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 1024, 1024, 1024, 1024, 1024, 1024], random_seed=random_seed, init_type="uniform")
+            # dnn1i = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 1024, 1024, 1024, 1024, 1024, 1024], random_seed=random_seed, init_type="normal")
+            # dnn_experiments = {
+            #     'dnn1h': dnn1h,
+            #     'dnn1i': dnn1i,
+            # }
+
+            ## v43
+            dnn2a = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 1024, 1024, 1024, 1024, 1024, 1024], random_seed=random_seed, init_type="uniform", normalization_type=normalization_type)
+            dnn2b = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 1024, 1024, 1024, 1024, 1024, 1024], random_seed=random_seed, init_type="normal", normalization_type=normalization_type)
+            dnn2c = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 768, 512, 384, 256, 192, 128, 96], random_seed=random_seed, init_type="uniform", normalization_type=normalization_type)
+            dnn2d = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 768, 512, 384, 256, 192, 128, 96], random_seed=random_seed, init_type="normal", normalization_type=normalization_type)
             dnn_experiments = {
-                'dnn2i': dnn2i,
-                'dnn2j': dnn2j,
+                'dnn2a': dnn2a,
+                'dnn2b': dnn2b,
+                'dnn2c': dnn2c,
+                'dnn2d': dnn2d,
             }
             
         dnn_learning_rates_dict = eval(args.learning_rates_dict)
@@ -1215,7 +1279,8 @@ if __name__ == "__main__":
             N_EPOCHS=N_EPOCHS, 
             MAX_TRAIN_ATTEMPTS=5, 
             regularizer=None, 
-            debug=debug
+            add_diagonal_matrix=add_diagonal_matrix,
+            debug=debug,
         )
         
         ## save dnn_experiments_results using torch
@@ -1249,6 +1314,7 @@ if __name__ == "__main__":
             N_EPOCHS=None, 
             MAX_TRAIN_ATTEMPTS=None, 
             regularizer=None, 
+            add_diagonal_matrix=add_diagonal_matrix,
             debug=debug,
             noise_experiments=True,
             noise_vars=noise_vars,

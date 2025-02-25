@@ -1,9 +1,10 @@
 The goal of these experiments are to reproduce the results in the paper "On the Expressive Power of Deep Neural Networks" (2017) where one of the key findings is that for their trained ConvNet, the lower layers are more sensitive to noise than deeper layers. So far, the experiments have been inconclusive.
 
-To debug or run experiments locally, set the following flags. 
+To debug or run experiments locally, set the following flags. There are two types of experiments that can be run: (1) model training with learning rates passed in the command line arguments, and (2) noise layer experiments with the base amount of noise passed in the command line arguments
 
 export PYTORCH_ENABLE_MPS_FALLBACK='1'
-python -i dnn_weight_noise.py --experiment-version v1 --experiment-type cnn --cloud-environment local --debug-mode debug
+python -i dnn_weight_noise.py --experiment-version v29 --experiment-type dnn-train --learning-rates-dict "{'dnn2biii':[1e-3,1e-4,1e-5]}" --cloud-environment hpc --debug-mode experiment --normalization-type batch
+
 
 The default behavior is to generate the following figures for DNNs being trained from scratch.
 

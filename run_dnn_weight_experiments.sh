@@ -30,9 +30,21 @@ nvidia-smi  # This will show the GPU status assigned to your job
 # echo "--- Running python script dnn_weight_noise.py TRAINING ---"
 # python -i dnn_weight_noise.py --experiment-version v37 --experiment-type dnn-train --learning-rates-dict "{'dnn2g':[1e-3,5e-4,1e-4], 'dnn2h':[1e-3,5e-4,1e-4]}" --cloud-environment hpc --debug-mode experiment
 # python -i dnn_weight_noise.py --experiment-version v38 --experiment-type dnn-train --learning-rates-dict "{'dnn2i':[1e-3,5e-4,1e-4], 'dnn2j':[1e-3,5e-4,1e-4]}" --cloud-environment hpc --debug-mode experiment
+# python -i dnn_weight_noise.py --experiment-version v39 --experiment-type dnn-train --learning-rates-dict "{'dnn1a':[1e-3,5e-4,1e-4], 'dnn1b':[1e-3,5e-4,1e-4], 'dnn1c':[1e-3,5e-4,1e-4], 'dnn1d':[1e-3,5e-4,1e-4]}" --cloud-environment hpc --debug-mode experiment
+# python -i dnn_weight_noise.py --experiment-version v40 --experiment-type dnn-train --learning-rates-dict "{'dnn1e':[1e-3,5e-4,1e-4], 'dnn1f':[1e-3,5e-4,1e-4]}" --cloud-environment hpc --debug-mode experiment
+# python -i dnn_weight_noise.py --experiment-version v41 --experiment-type dnn-train --learning-rates-dict "{'dnn1h':[1e-3,5e-4,1e-4], 'dnn1i':[1e-3,5e-4,1e-4]}" --cloud-environment hpc --debug-mode experiment
+# python -i dnn_weight_noise.py --experiment-version v42 --experiment-type dnn-train --learning-rates-dict "{'dnn1j':[1e-3,5e-4,1e-4], 'dnn1k':[1e-3,5e-4,1e-4]}" --cloud-environment hpc --debug-mode experiment --normalization-type batch
+# python -i dnn_weight_noise.py --experiment-version v43 --experiment-type dnn-train --learning-rates-dict "{'dnn2a':[1e-3,5e-4,1e-4], 'dnn2b':[1e-3,5e-4,1e-4], 'dnn2c':[1e-3,5e-4,1e-4], 'dnn2d':[1e-3,5e-4,1e-4]}" --cloud-environment hpc --debug-mode experiment --normalization-type batch
+
+# python -i dnn_weight_noise.py --experiment-version v37 --experiment-type dnn-train --learning-rates-dict "{'dnn2h':[1e-4]}" --cloud-environment hpc --debug-mode experiment
+# python -i dnn_weight_noise.py --experiment-version v38 --experiment-type dnn-train --learning-rates-dict "{'dnn2k':[1e-3,5e-4,1e-4]}" --cloud-environment local --debug-mode debug
 
 # Uncomment for noise experiments
 echo "--- Running python script dnn_weight_noise.py NOISE EXPERIMENT ---"
-python -i dnn_weight_noise.py --experiment-version v35 --experiment-type dnn-load-model --pretrained-model-name "dnn_experiments_results.pth" --noise-vars "[0.1, 0.5, 1.0, 1.5, 2.0]" --noise-type "layer_variance" --cloud-environment hpc --debug-mode experiment
-python -i dnn_weight_noise.py --experiment-version v36 --experiment-type dnn-load-model --pretrained-model-name "dnn_experiments_results.pth" --noise-vars "[0.1, 0.5, 1.0, 1.5, 2.0]" --noise-type "layer_variance" --cloud-environment hpc --debug-mode experiment
-# python -i dnn_weight_noise.py --experiment-version v36 --experiment-type dnn-load-model --pretrained-model-name "dnn_experiments_results.pth" --noise-vars "[0.1, 0.5, 1.0, 1.5, 2.0]" --noise-type "all" --cloud-environment hpc --debug-mode experiment
+# python -i dnn_weight_noise.py --experiment-version v35 --experiment-type dnn-load-model --pretrained-model-name "dnn_experiments_results.pth" --noise-vars "[0.1, 0.5, 1.0, 1.5, 2.0]" --noise-type "layer_variance" --cloud-environment hpc --debug-mode experiment
+# python -i dnn_weight_noise.py --experiment-version v36 --experiment-type dnn-load-model --pretrained-model-name "dnn_experiments_results.pth" --noise-vars "[0.1, 0.5, 1.0, 1.5, 2.0]" --noise-type "layer_variance" --cloud-environment hpc --debug-mode experiment
+# python -i dnn_weight_noise.py --experiment-version v37 --experiment-type dnn-load-model --pretrained-model-name "dnn_experiments_results.pth" --noise-vars "[0.1, 0.5, 1.0, 1.5, 2.0]" --noise-type "all" --cloud-environment hpc --debug-mode experiment
+# python -i dnn_weight_noise.py --experiment-version v38 --experiment-type dnn-load-model --pretrained-model-name "dnn_experiments_results.pth" --noise-vars "[0.1, 0.5, 1.0, 1.5, 2.0]" --noise-type "all" --cloud-environment hpc --debug-mode experiment
+# python -i dnn_weight_noise.py --experiment-version v39 --experiment-type dnn-load-model --pretrained-model-name "dnn_experiments_results.pth" --noise-vars "[0.1, 0.5, 1.0, 1.5, 2.0]" --noise-type "all" --cloud-environment hpc --debug-mode experiment
+# python -i dnn_weight_noise.py --experiment-version v40 --experiment-type dnn-load-model --pretrained-model-name "dnn_experiments_results.pth" --noise-vars "[0.1, 0.5, 1.0, 1.5, 2.0]" --noise-type "all" --cloud-environment hpc --debug-mode experiment
+python -i dnn_weight_noise.py --experiment-version v43 --experiment-type dnn-load-model --pretrained-model-name "dnn_experiments_results.pth" --noise-vars "[0.1, 0.5, 1.0, 1.5, 2.0]" --noise-type "all" --cloud-environment hpc --debug-mode experiment
