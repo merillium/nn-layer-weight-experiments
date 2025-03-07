@@ -52,18 +52,25 @@ class DNN(nn.Module):
                 hidden_layers.append(first_hidden_layer)
             else:
                 previous_layer_width = self._HIDDEN_LAYER_WIDTHS[i-1]
-                hidden_layers.append(nn.Linear(previous_layer_width, layer_width))
-            
-            ## add batch norm layer
-            if normalization_type.upper() == 'BATCH':
-                hidden_layers.append(nn.BatchNorm1d(num_features=layer_width))
-            elif normalization_type is None:
-                pass
-            else:
-                raise Exception(f"Normalization of type {normalization_type} not yet implemented or supported!")
 
-            ## add RELU activation layer
-            hidden_layers.append(nn.ReLU())
+                ## add linear layer, batch/layer norm, and Relu
+                ## for weight norm, directly apply to linear layer
+                if normalization_type.upper() == 'BATCH':
+                    hidden_layers.append(nn.Linear(previous_layer_width, layer_width))
+                    hidden_layers.append(nn.BatchNorm1d(num_features=layer_width))
+                    hidden_layers.append(nn.ReLU())
+                elif normalization_type.upper() == 'LAYER':
+                    hidden_layers.append(nn.Linear(previous_layer_width, layer_width))
+                    hidden_layers.append(nn.LayerNorm(normalized_shape=layer_width))
+                    hidden_layers.append(nn.ReLU())
+                elif normalization_type.upper() == 'WEIGHT':
+                    hidden_layers.append(nn.utils.parametrizations.weight_norm(nn.Linear(previous_layer_width, layer_width)))
+                    hidden_layers.append(nn.ReLU())
+                elif normalization_type is None:
+                    pass
+                else:
+                    raise Exception(f"Normalization of type {normalization_type} not yet implemented or supported!")
+            
         output_layer = [nn.Linear(self._HIDDEN_LAYER_WIDTHS[-1], self._N_CLASSES)]
         all_layers = hidden_layers + output_layer
 
@@ -122,7 +129,7 @@ class DnnLayerWeightExperiment():
         for name, module in self.model.named_modules():
             ## weights come before biases
 
-            print(f"layer name: {name} of type {type(module)}")
+            # print(f"layer name: {name} of type {type(module)}")
 
             if isinstance(module, nn.modules.linear.Linear):
                 print(f"found linear layer for n = {n}")
@@ -139,8 +146,10 @@ class DnnLayerWeightExperiment():
                     }
                     self.model_layer_info[f'layer_{n}']['initial_weights'] = module.weight.data.clone().numpy()
                     self.model_layer_info[f'layer_{n}']['initial_biases'] = module.bias.data.clone().numpy()
-                    print(self.model_layer_info[f'layer_{n}']['initial_weights'].shape)
-                    print(self.model_layer_info[f'layer_{n}']['initial_biases'].shape)
+                    
+                    # print(self.model_layer_info[f'layer_{n}']['initial_weights'].shape)
+                    # print(self.model_layer_info[f'layer_{n}']['initial_biases'].shape)
+
                     n += 1
                 else:
                     pass
@@ -166,9 +175,11 @@ class DnnLayerWeightExperiment():
             'condition_numbers_by_epoch': None,
             'min_singular_value_by_epoch': None,
             'max_singular_value_by_epoch': None,
+            'weight_means_by_epoch': None,
             'weight_stds_by_epoch': None,
             'accuracies_by_epoch': None,
             'noise_test_accuracies': None,
+            'layer_noise_test_accuracies': None,
             'condition_numbers_by_layer': None
         }
     
@@ -227,7 +238,7 @@ class DnnLayerWeightExperiment():
             self.test_data = datasets.CIFAR10('./data', train=False, transform=transform, download=True)
 
         else:
-            raise Exception("Dataset {self.dataset_name} not supported")
+            raise Exception(f"Dataset {self.dataset_name} not supported")
         
         ## create DataLoaders
         trainloader = DataLoader(self.train_data, batch_size=128, shuffle=True, num_workers=2)
@@ -282,6 +293,7 @@ class DnnLayerWeightExperiment():
                 'initial_biases': self.model_layer_info[f'layer_{i}']['initial_biases'].copy(),
                 'final_weights': None,
                 'final_biases': None,
+                'weight_mean_by_epoch': [],
                 'weight_std_by_epoch': [],
                 'cond_number_by_epoch': [],
                 'min_singular_value_by_epoch': [],
@@ -681,6 +693,11 @@ class DnnLayerWeightExperiment():
                 rows=int(np.ceil(self.model._N_LAYERS/2)), cols=2,
                 subplot_titles=[f"Layer {i}" for i in range(1,self.model._N_LAYERS+1)]
             )
+
+            fig_weight_means = make_subplots(
+                rows=int(np.ceil(self.model._N_LAYERS/2)), cols=2,
+                subplot_titles=[f"Layer {i}" for i in range(1,self.model._N_LAYERS+1)]
+            )
             
             fig_weight_stds = make_subplots(
                 rows=int(np.ceil(self.model._N_LAYERS/2)), cols=2,
@@ -875,7 +892,19 @@ class DnnLayerWeightExperiment():
         if not self.preloaded:
             for noise_type in noise_types:
                 self.all_layer_noise_test_acc[noise_type]["noise_vars"] = noise_vars
-            n_stack_layers = [int(''.join(filter(str.isdigit, layer))) for layer in self.model.state_dict() if (("weight" in layer) and ("classifier" not in layer))]
+            
+            n_stack_layers = []
+            for name, module in self.model.named_modules():
+                print(f"layer name: {name} of type {type(module)}")
+                # layer name: linear_relu_stack.0
+                # layer name: linear_relu_stack.1
+                # ...
+
+                if isinstance(module, nn.modules.linear.Linear):
+                    layer_num = name.split('.')[-1]
+                    n_stack_layers.append(layer_num)
+            
+            # n_stack_layers = [int(''.join(filter(str.isdigit, layer))) for layer in self.model.state_dict() if (("weight" in layer) and ("classifier" not in layer))]
             print(n_stack_layers)
         
         ## a preloaded CNN model has a different architecture
@@ -989,6 +1018,8 @@ class DnnLayerWeightExperiment():
                 self.all_layer_noise_test_acc[noise_type][f'layer_{n+1}'] = np.array(layer_avg_test_accs)
 
     def create_accuracy_vs_noise_plots(self, noise_types):
+
+        row = 1
         for noise_type in noise_types:
             df_accuracy_vs_noise = pd.DataFrame(self.all_layer_noise_test_acc[noise_type])
             df_accuracy_vs_noise = df_accuracy_vs_noise.sort_values(by='noise_vars', ascending=True)
@@ -1019,6 +1050,19 @@ class DnnLayerWeightExperiment():
                 )
             
             fig_noise_vs_accuracy.update_traces(mode='lines+markers', opacity=0.8) 
+
+            df_layer_accuracy_vs_noise = df_accuracy_vs_noise.set_index('noise_vars').T
+            fig_layer_accuracy_vs_noise = make_subplots(rows=3, cols=1, subplot_titles=("Noise scaled to input layer size", "Noise scaled to output layer size", "Noise scaled to layer variance"))
+            for noise_var in df_layer_accuracy_vs_noise.columns:
+                showlegend = True if row == 1 else False
+                fig_layer_accuracy_vs_noise.add_trace(go.Scatter(
+                    x=fig_layer_accuracy_vs_noise.index.tolist(),
+                    y=fig_layer_accuracy_vs_noise[noise_var],
+                    name=f"noise = {noise_var}",
+                    marker=dict(color=self._layer_color_map[f"noise_var_{noise_var}"]),
+                    showlegend=showlegend,
+                ),col=1, row=row)
+            row += 1
             
             if self.preloaded:
                 
@@ -1032,6 +1076,8 @@ class DnnLayerWeightExperiment():
             
             fig_noise_vs_accuracy.update_layout(title=title, xaxis_title='noise vars (unscaled)', height=1200)
             self.all_figures[f'{noise_type}_noise_test_accuracies'] = fig_noise_vs_accuracy
+        self.all_figures['layer_noise_test_accuracies'] = fig_layer_accuracy_vs_noise
+        fig_layer_accuracy_vs_noise.show()
 
 def run_dnn_experiments(
     dnn_experiments, 
@@ -1260,10 +1306,34 @@ if __name__ == "__main__":
             # }
 
             ## v43
+            # dnn2a = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 1024, 1024, 1024, 1024, 1024, 1024], random_seed=random_seed, init_type="uniform", normalization_type=normalization_type)
+            # dnn2b = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 1024, 1024, 1024, 1024, 1024, 1024], random_seed=random_seed, init_type="normal", normalization_type=normalization_type)
+            # dnn2c = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 768, 512, 384, 256, 192, 128, 96], random_seed=random_seed, init_type="uniform", normalization_type=normalization_type)
+            # dnn2d = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 768, 512, 384, 256, 192, 128, 96], random_seed=random_seed, init_type="normal", normalization_type=normalization_type)
+            # dnn_experiments = {
+            #     'dnn2a': dnn2a,
+            #     'dnn2b': dnn2b,
+            #     'dnn2c': dnn2c,
+            #     'dnn2d': dnn2d,
+            # }
+
+            ## v44
+            # dnn2a = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 1024, 1024, 1024, 1024, 1024, 1024], random_seed=random_seed, init_type="uniform", normalization_type=normalization_type)
+            # dnn2b = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 1024, 1024, 1024, 1024, 1024, 1024], random_seed=random_seed, init_type="normal", normalization_type=normalization_type)
+            # dnn2c = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 768, 512, 384, 256, 192, 128], random_seed=random_seed, init_type="uniform", normalization_type=normalization_type)
+            # dnn2d = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 768, 512, 384, 256, 192, 128], random_seed=random_seed, init_type="normal", normalization_type=normalization_type)
+            # dnn_experiments = {
+            #     'dnn2a': dnn2a,
+            #     'dnn2b': dnn2b,
+            #     'dnn2c': dnn2c,
+            #     'dnn2d': dnn2d,
+            # }
+
+            ## v45
             dnn2a = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 1024, 1024, 1024, 1024, 1024, 1024], random_seed=random_seed, init_type="uniform", normalization_type=normalization_type)
             dnn2b = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 1024, 1024, 1024, 1024, 1024, 1024], random_seed=random_seed, init_type="normal", normalization_type=normalization_type)
-            dnn2c = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 768, 512, 384, 256, 192, 128, 96], random_seed=random_seed, init_type="uniform", normalization_type=normalization_type)
-            dnn2d = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 768, 512, 384, 256, 192, 128, 96], random_seed=random_seed, init_type="normal", normalization_type=normalization_type)
+            dnn2c = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 768, 512, 384, 256, 192, 128], random_seed=random_seed, init_type="uniform", normalization_type=normalization_type)
+            dnn2d = DNN(N_CLASSES=10, HIDDEN_LAYER_WIDTHS=[1024, 768, 512, 384, 256, 192, 128], random_seed=random_seed, init_type="normal", normalization_type=normalization_type)
             dnn_experiments = {
                 'dnn2a': dnn2a,
                 'dnn2b': dnn2b,
@@ -1293,6 +1363,7 @@ if __name__ == "__main__":
     if experiment_type.upper() == 'DNN-LOAD-MODEL':
         model_name = args.pretrained_model_name
         full_model_path = directory + '/' + model_name
+        print(f"loading model from {full_model_path}")
         dnn_experiments = torch.load(full_model_path, weights_only=False)
         # {
         #     'dnn1': trained_dnn1,
