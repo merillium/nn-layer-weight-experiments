@@ -8,3 +8,5 @@ experiment_plots/
 **/._.DS_Store
 .zip
 average_DNN/
+legacy/
+**.sh
