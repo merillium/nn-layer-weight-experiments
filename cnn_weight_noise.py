@@ -28,12 +28,14 @@ print(torch.cuda.device_count())
 device = ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 
 class CNN(nn.Module):
-    """Creates a CNN based on the VGG16 architecture, but with different possible normalizations"""
+    """Creates a CNN based on the VGG11 architecture, but with different possible normalizations"""
     def __init__(self, IN_CHANNELS, N_CLASSES, DATASET_NAME, random_seed, init_type, normalization_type):
         super().__init__()
         self._IN_CHANNELS = IN_CHANNELS
         self._N_CLASSES = N_CLASSES
         self._DATASET_NAME = DATASET_NAME
+
+        self._INPUT_SHAPE = [224, 224]
 
         self.random_seed = random_seed
         self.init_type = init_type
@@ -47,29 +49,134 @@ class CNN(nn.Module):
         ## NOTE: ideally we should parametrize 28 x 28 or 32 x 32
         ## and construct the layers a more dynamic fashion
 
-        self.conv_layers = nn.Sequential(
-            nn.Conv2d(self._IN_CHANNELS, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Conv2d(128, 256, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(256, 256, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Conv2d(256, 512, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(512, 512, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Conv2d(512, 512, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(512, 512, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2)
-        )
+        ## nn.Conv2d(64, 128, kernel_size=3, padding=1),
+        ## 128 learnable filters on the 64 channels, each filter is of size (64, 3, 3)
+        ## so each of the 128 filters is a stack of 64 individual 3×3 filters
+
+        if self.normalization_type.upper() == 'NONE':
+            self.conv_layers = nn.Sequential(
+                nn.Conv2d(self._IN_CHANNELS, 64, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.MaxPool2d(kernel_size=2, stride=2),
+                nn.Conv2d(64, 128, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.MaxPool2d(kernel_size=2, stride=2),
+                nn.Conv2d(128, 256, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(256, 256, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.MaxPool2d(kernel_size=2, stride=2),
+                nn.Conv2d(256, 512, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(512, 512, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.MaxPool2d(kernel_size=2, stride=2),
+                nn.Conv2d(512, 512, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(512, 512, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.MaxPool2d(kernel_size=2, stride=2)
+            )
+        elif self.normalization_type.upper() == 'BATCH':
+            self.conv_layers = nn.Sequential(
+                nn.Conv2d(self._IN_CHANNELS, 64, kernel_size=3, padding=1),
+                nn.BatchNorm2d(64),
+                nn.ReLU(),
+                nn.MaxPool2d(kernel_size=2, stride=2),
+                nn.Conv2d(64, 128, kernel_size=3, padding=1),
+                nn.BatchNorm2d(128),
+                nn.ReLU(),
+                nn.MaxPool2d(kernel_size=2, stride=2),
+                nn.Conv2d(128, 256, kernel_size=3, padding=1),
+                nn.BatchNorm2d(256),
+                nn.ReLU(),
+                nn.Conv2d(256, 256, kernel_size=3, padding=1),
+                nn.BatchNorm2d(256),
+                nn.ReLU(),
+                nn.MaxPool2d(kernel_size=2, stride=2),
+                nn.Conv2d(256, 512, kernel_size=3, padding=1),
+                nn.BatchNorm2d(512),
+                nn.ReLU(),
+                nn.Conv2d(512, 512, kernel_size=3, padding=1),
+                nn.BatchNorm2d(512),
+                nn.ReLU(),
+                nn.MaxPool2d(kernel_size=2, stride=2),
+                nn.Conv2d(512, 512, kernel_size=3, padding=1),
+                nn.BatchNorm2d(512),
+                nn.ReLU(),
+                nn.Conv2d(512, 512, kernel_size=3, padding=1),
+                nn.BatchNorm2d(512),
+                nn.ReLU(),
+                nn.MaxPool2d(kernel_size=2, stride=2)
+            )
+        
+        ## this is tricky! nn.GroupNorm(1, N_CHANNELS) is equivalent to layer norm
+        elif self.normalization_type.upper() == 'LAYER':
+            self.conv_layers = nn.Sequential(
+                nn.Conv2d(self._IN_CHANNELS, 64, kernel_size=3, padding=1),
+                nn.GroupNorm(1, 64),
+                nn.ReLU(),
+                nn.MaxPool2d(kernel_size=2, stride=2),
+                nn.Conv2d(64, 128, kernel_size=3, padding=1),
+                nn.GroupNorm(1, 128),
+                nn.ReLU(),
+                nn.MaxPool2d(kernel_size=2, stride=2),
+                nn.Conv2d(128, 256, kernel_size=3, padding=1),
+                nn.GroupNorm(1, 256),
+                nn.ReLU(),
+                nn.Conv2d(256, 256, kernel_size=3, padding=1),
+                nn.GroupNorm(1, 256),
+                nn.ReLU(),
+                nn.MaxPool2d(kernel_size=2, stride=2),
+                nn.Conv2d(256, 512, kernel_size=3, padding=1),
+                nn.GroupNorm(1, 512),
+                nn.ReLU(),
+                nn.Conv2d(512, 512, kernel_size=3, padding=1),
+                nn.GroupNorm(1, 512),
+                nn.ReLU(),
+                nn.MaxPool2d(kernel_size=2, stride=2),
+                nn.Conv2d(512, 512, kernel_size=3, padding=1),
+                nn.GroupNorm(1, 512),
+                nn.ReLU(),
+                nn.Conv2d(512, 512, kernel_size=3, padding=1),
+                nn.GroupNorm(1, 512),
+                nn.ReLU(),
+                nn.MaxPool2d(kernel_size=2, stride=2)
+            )
+        elif self.normalization_type.upper() == 'GROUP':
+            self.conv_layers = nn.Sequential(
+                nn.Conv2d(self._IN_CHANNELS, 64, kernel_size=3, padding=1),
+                nn.GroupNorm(8, 64),
+                nn.ReLU(),
+                nn.MaxPool2d(kernel_size=2, stride=2),
+                nn.Conv2d(64, 128, kernel_size=3, padding=1),
+                nn.GroupNorm(8, 128),
+                nn.ReLU(),
+                nn.MaxPool2d(kernel_size=2, stride=2),
+                nn.Conv2d(128, 256, kernel_size=3, padding=1),
+                nn.GroupNorm(16, 256),
+                nn.ReLU(),
+                nn.Conv2d(256, 256, kernel_size=3, padding=1),
+                nn.GroupNorm(16, 256),
+                nn.ReLU(),
+                nn.MaxPool2d(kernel_size=2, stride=2),
+                nn.Conv2d(256, 512, kernel_size=3, padding=1),
+                nn.GroupNorm(16, 512),
+                nn.ReLU(),
+                nn.Conv2d(512, 512, kernel_size=3, padding=1),
+                nn.GroupNorm(16, 512),
+                nn.ReLU(),
+                nn.MaxPool2d(kernel_size=2, stride=2),
+                nn.Conv2d(512, 512, kernel_size=3, padding=1),
+                nn.GroupNorm(16, 512),
+                nn.ReLU(),
+                nn.Conv2d(512, 512, kernel_size=3, padding=1),
+                nn.GroupNorm(16, 512),
+                nn.ReLU(),
+                nn.MaxPool2d(kernel_size=2, stride=2)
+            )
+        else:
+            raise Exception(f"normalization of type {self.normalization_type} not supported!")
 
         # fully connected linear layers
         self.linear_layers = nn.Sequential(
@@ -295,7 +402,7 @@ class CnnLayerWeightExperiment():
         l2_loss = torch.tensor(0.)
         loss_function = nn.CrossEntropyLoss()
 
-        ## layer l2
+        ## layer l2, this needs to be changed for CNN
         if regularizer == 'layer-l2':
             layer_multiplier = 1
             for name, module in self.model.named_modules():
@@ -1117,7 +1224,7 @@ def run_cnn_experiments(
             if debug:
                 cnn_experiment.create_models_with_noise(N_NOISE_SAMPLES=2, noise_vars=noise_vars, noise_types=noise_types)
             else:
-                cnn_experiment.create_models_with_noise(N_NOISE_SAMPLES=100, noise_vars=noise_vars, noise_types=noise_types)
+                cnn_experiment.create_models_with_noise(N_NOISE_SAMPLES=50, noise_vars=noise_vars, noise_types=noise_types)
             
             cnn_experiment.create_accuracy_vs_noise_plots(noise_types=noise_types)
 
@@ -1146,7 +1253,7 @@ if __name__ == "__main__":
     parser.add_argument("--noise-type", help="Pass a noise type or generate figures for all possible types of noise", choices=["input_dim","output_dim","layer_variance","all"], default="all", required=False)
     parser.add_argument("--cloud-environment", type=str, help="Local or Tufts HPC", choices=["local","hpc"], required=True)
     parser.add_argument("--debug-mode", type=str, help="Debug Mode or actual experiment", choices=["debug","experiment"], required=True)
-    parser.add_argument("--normalization-type", type=str, help="Add normalization before RELU during training", choices=["batch","layer","weight","none"], required=True)
+    parser.add_argument("--normalization-type", type=str, help="Add normalization before RELU during training", choices=["batch","group","layer","weight","none"], required=True)
     args = parser.parse_args()
 
     version = args.experiment_version

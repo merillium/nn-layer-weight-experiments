@@ -22,9 +22,9 @@ import plotly.express as px
 
 from utils import fit_gaussian_curve, init_weights
 
-# print(torch.__version__)
-# print(torch.cuda.is_available())
-# print(torch.cuda.device_count())
+print(torch.__version__)
+print(torch.cuda.is_available())
+print(torch.cuda.device_count())
 device = ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 
 class DNN(nn.Module):
@@ -79,6 +79,7 @@ class DNN(nn.Module):
                     hidden_layers.append(nn.ReLU())
                 elif self.normalization_type.upper() == 'NONE':
                     hidden_layers.append(nn.Linear(previous_layer_width, layer_width))
+                    hidden_layers.append(nn.ReLU())
                 else:
                     raise Exception(f"Normalization of type {normalization_type} not yet implemented or supported!")
             
@@ -125,6 +126,7 @@ class DiagDNN(nn.Module):
 
         ## the individual diagonal values are the parameters, not the diagonal matrix itself
         ## we want to fix all of them constant?
+        np.random.seed(42)
         self.diag_params = nn.ParameterList([
             nn.Parameter(torch.tensor(10**-5)) for _ in self._HIDDEN_LAYER_WIDTHS + [self._N_CLASSES]
         ])
@@ -141,9 +143,11 @@ class DiagDNN(nn.Module):
             if i == 0:
                 first_hidden_layer = nn.Linear(32 * 32 * 3, layer_width)
                 hidden_layers.append(first_hidden_layer)
+                hidden_layers.append(nn.ReLU())
             else:
                 previous_layer_width = self._HIDDEN_LAYER_WIDTHS[i-1]
                 hidden_layers.append(nn.Linear(previous_layer_width, layer_width))
+                hidden_layers.append(nn.ReLU())
 
         output_layer = [nn.Linear(self._HIDDEN_LAYER_WIDTHS[-1], self._N_CLASSES)]
         all_layers = hidden_layers + output_layer
@@ -191,6 +195,89 @@ class DiagDNN(nn.Module):
                 layer_idx += 1
             elif isinstance(layer, nn.ReLU):
                 x = layer(x)
+        return x
+
+class CNN(nn.Module):
+    """Creates a CNN based on the VGG11 architecture, but with different possible normalizations"""
+    def __init__(self, N_CLASSES, DATASET_NAME, HIDDEN_LAYER_WIDTHS, random_seed, init_type, normalization_type):
+        super().__init__()
+        self._N_CLASSES = N_CLASSES
+        self._DATASET_NAME = DATASET_NAME
+
+        self._HIDDEN_LAYER_WIDTHS = HIDDEN_LAYER_WIDTHS
+        self._N_HIDDEN_LAYERS = len(self._HIDDEN_LAYER_WIDTHS) 
+        self._N_LAYERS = self._N_HIDDEN_LAYERS+1 # hidden layers + 1 output layer
+
+        self.random_seed = random_seed
+        self.init_type = init_type
+        self.normalization_type = str(normalization_type)
+
+        if device=="mps":
+            torch.mps.manual_seed(self.random_seed)
+        if device=="cuda":
+            torch.cuda.manual_seed(self.random_seed)
+
+        ## NOTE: ideally we should parametrize 28 x 28 or 32 x 32
+        ## and construct the layers a more dynamic fashion
+        hidden_layers = []
+        for i, layer_width in enumerate(self._HIDDEN_LAYER_WIDTHS):
+            if i == 0:
+                if self._DATASET_NAME.upper() == 'MNIST':
+                    first_hidden_layer = nn.Linear(28 * 28 * 1, layer_width)
+                elif self._DATASET_NAME.upper() == 'FASHION_MNIST':
+                    first_hidden_layer = nn.Linear(28 * 28 * 1, layer_width)
+                elif self._DATASET_NAME.upper() == 'CIFAR10':
+                    first_hidden_layer = nn.Linear(32 * 32 * 3, layer_width)
+                else:
+                    raise Exception(f"Unsupported dataset: {self._DATASET_NAME}")
+                hidden_layers.append(first_hidden_layer)
+
+            else:
+                previous_layer_width = self._HIDDEN_LAYER_WIDTHS[i-1]
+
+                ## add linear layer, batch/layer norm, and Relu
+                ## for weight norm, directly apply to linear layer
+                if self.normalization_type.upper() == 'BATCH':
+                    hidden_layers.append(nn.Linear(previous_layer_width, layer_width))
+                    hidden_layers.append(nn.BatchNorm1d(num_features=layer_width))
+                    hidden_layers.append(nn.ReLU())
+                elif self.normalization_type.upper() == 'LAYER':
+                    hidden_layers.append(nn.Linear(previous_layer_width, layer_width))
+                    hidden_layers.append(nn.LayerNorm(normalized_shape=layer_width))
+                    hidden_layers.append(nn.ReLU())
+                elif self.normalization_type.upper() == 'WEIGHT':
+                    hidden_layers.append(nn.utils.parametrizations.weight_norm(nn.Linear(previous_layer_width, layer_width)))
+                    hidden_layers.append(nn.ReLU())
+                elif self.normalization_type.upper() == 'NONE':
+                    hidden_layers.append(nn.Linear(previous_layer_width, layer_width))
+                    hidden_layers.append(nn.ReLU())
+                else:
+                    raise Exception(f"Normalization of type {normalization_type} not yet implemented or supported!")
+            
+        output_layer = [nn.Linear(self._HIDDEN_LAYER_WIDTHS[-1], self._N_CLASSES)]
+        all_layers = hidden_layers + output_layer
+
+        self.linear_relu_stack = nn.Sequential(*all_layers)
+        self.initialize_weights()
+    
+    def initialize_weights(self, new_random_seed=None):
+        """Convenience method to initialize or re-initialize weights"""
+        if new_random_seed is not None:
+            self.random_seed = new_random_seed
+        self.linear_relu_stack.apply(lambda m: init_weights(m, self.init_type, self.random_seed))
+    
+    def forward(self, x):
+        if self._DATASET_NAME == 'mnist':
+            x = x.view(-1, 28 * 28 * 1)
+        elif self._DATASET_NAME == 'fashion_mnist':
+            x = x.view(-1, 28 * 28 * 1)
+        elif self._DATASET_NAME == 'cifar10':
+            x = x.view(-1, 32 * 32 * 3) # this should be parametrized ideally
+        else:
+            raise Exception(f"Unsupported dataset: {self._DATASET_NAME}")
+        
+        # x = x.view(-1, 32 * 32 * 3) # this should be parametrized ideally
+        x = self.linear_relu_stack(x)
         return x
 
 class DnnLayerWeightExperiment():
@@ -330,7 +417,6 @@ class DnnLayerWeightExperiment():
             self.train_data, self.val_data = random_split(dataset, [train_size, val_size])
             self.test_data = datasets.MNIST('./data', train=False, transform=transform, download=True)
         
-        ## this hasn't been tested yet
         elif self.dataset_name == 'cifar10':
             transform = transforms.Compose([
                 transforms.ToTensor(),
@@ -375,7 +461,15 @@ class DnnLayerWeightExperiment():
         l2_loss = torch.tensor(0.)
         loss_function = nn.CrossEntropyLoss()
 
-        if regularizer == 'l2':
+        ## layer l2
+        if regularizer == 'layer-l2':
+            layer_multiplier = 1
+            for name, module in self.model.named_modules():
+                if isinstance(module, nn.modules.linear.Linear):
+                    l2_loss = l2_loss + layer_multiplier * torch.linalg.norm(module.weight, 2).detach() ** 2
+                    layer_multiplier *= 0.5
+        elif regularizer == 'l2':
+            layer_multiplier = 1
             for name, module in self.model.named_modules():
                 if isinstance(module, nn.modules.linear.Linear):
                     l2_loss = l2_loss + torch.linalg.norm(module.weight, 2).detach() ** 2
@@ -426,7 +520,7 @@ class DnnLayerWeightExperiment():
                     'cond_number_by_epoch': [],
                     'min_singular_value_by_epoch': [],
                     'max_singular_value_by_epoch': [],
-                    'diag_param_by_epoch': []
+                    'diag_params_by_epoch': []
                 } for i in range(1,self.model._N_LAYERS+1)
             }
         else:
@@ -438,8 +532,21 @@ class DnnLayerWeightExperiment():
 
             print(f"Trying learning rate = {lr}")
 
-            # optimizer = optim.SGD(self.model.parameters(), lr=lr, momentum=0.9, weight_decay=l2_lambda, nesterov=True)
-            optimizer = optim.Adam(self.model.parameters(), lr=lr)
+            if isinstance(self.model, DNN):
+                optimizer = optim.Adam(self.model.parameters(), lr=lr)
+            elif isinstance(self.model, DiagDNN):
+
+                # Set up optimizer with parameter groups
+                # optimizer = optim.Adam([
+                #     {'params': self.model.all_layers.parameters(), 'lr': lr},  # Weights
+                #     {'params': self.model.diag_params, 'lr': 1e-2 * lr}  # Diagonal parameters
+                # ])
+
+                optimizer = optim.Adam([
+                    {'params': self.model.all_layers.parameters(), 'lr': lr}
+                ] + [{'params': [diag], 'lr': 1e-2 * lr} for diag in self.model.diag_params])
+            
+            # Set up optimizer with parameter groups
             scheduler = ReduceLROnPlateau(optimizer, 'min', patience=10, factor=0.2)
 
             for epoch in range(N_EPOCHS):
@@ -540,8 +647,9 @@ class DnnLayerWeightExperiment():
                         weight_abs_min = np.min(np.abs(layer_weights.flatten()))
 
                         if isinstance(self.model, DiagDNN):
-                            layer_diag_param = self.model.diag_params[layer_idx]
-                            model_layer_info[f'layer_{n}']['diag_param_by_epoch'].append(layer_diag_param)
+                            layer_diag_param = self.model.diag_params[layer_idx].data.item()
+                            model_layer_info[f'layer_{n}']['diag_params_by_epoch'].append(layer_diag_param)
+                            layer_idx += 1
 
                         ## we store the condition number and weight std by epoch
                         ## and set this to the actual model's info if this epoch does the best
@@ -625,7 +733,7 @@ class DnnLayerWeightExperiment():
                         'cond_number_by_epoch': [],
                         'min_singular_value_by_epoch': [],
                         'max_singular_value_by_epoch': [],
-                        'diag_param_by_epoch': []
+                        'diag_params_by_epoch': []
                     } for i in range(1,self.model._N_LAYERS+1)
                 }
 
@@ -885,6 +993,13 @@ class DnnLayerWeightExperiment():
                 vertical_spacing=0.05
             )
 
+            if isinstance(self.model, DiagDNN):
+                fig_diag_params = make_subplots(
+                    rows=int(np.ceil(self.model._N_LAYERS/2)), cols=2,
+                    subplot_titles=[f"Diag Param Values for Layer {i} weights" for i in range(1,self.model._N_LAYERS+1)],
+                    vertical_spacing=0.05
+                )
+
             ## singular values by layer requires matplotlib
 
             number_of_layers = len(self.model_layer_info.keys())
@@ -988,6 +1103,16 @@ class DnnLayerWeightExperiment():
                     ), row=row, col=col
                 )
 
+                if isinstance(self.model, DiagDNN):
+                    fig_diag_params.append_trace(
+                        go.Scatter(
+                            x=list(range(self._N_EPOCHS)), 
+                            y=self.model_layer_info[f'layer_{i}']['diag_params_by_epoch'],
+                            marker=dict(color=self._layer_color_map[f"layer_{i}"]),
+                            name=f"layer_{i}",
+                        ), row=row, col=col
+                    )
+
                 ## append to final layer metrics
                 final_max_singular.append(self.model_layer_info[f'layer_{i}']['max_singular_value_by_epoch'][-1])
                 final_min_singular.append(self.model_layer_info[f'layer_{i}']['min_singular_value_by_epoch'][-1])
@@ -1051,6 +1176,9 @@ class DnnLayerWeightExperiment():
             self.all_figures['weight_means_by_epoch'] = fig_weight_means
             self.all_figures['weight_stds_by_epoch'] = fig_weight_stds
             self.all_figures['accuracies_by_epoch'] = fig_accuracies
+
+            if isinstance(self.model, DiagDNN):
+                self.all_figures['diag_params_by_epoch'] = fig_diag_params
             
         ################################################ 
         # FOR PRELOADED MODEL, ONLY PLOT FINAL WEIGHTS #
@@ -1218,7 +1346,6 @@ class DnnLayerWeightExperiment():
                 for noise_var in noise_vars: 
                     test_acc_sum = 0
 
-                    
                     ## layer weights have dimension (output_dim, input_dim)
                     if not self.preloaded:
                         if noise_type == "input_dim":
@@ -1242,12 +1369,15 @@ class DnnLayerWeightExperiment():
 
                         ## find the layer, add noise
                         with torch.no_grad():
-                            if not self.preloaded:
+                            if isinstance(self.model, DNN):
                                 weight_layer_string = f"linear_relu_stack.{n_stack}.weight"
                                 bias_layer_string = f"linear_relu_stack.{n_stack}.bias"
+                            elif isinstance(self.model, DiagDNN):
+                                weight_layer_string = f"all_layers.{n_stack}.weight"
+                                bias_layer_string = f"all_layers.{n_stack}.bias"
                             else:
-                                weight_layer_string = f"features.{n_stack}.weight"
-                                bias_layer_string = f"features.{n_stack}.bias"
+                                raise Exception(f"model of type {type(self.model)} not supported")
+
                             
                             print(f"adding noise to {weight_layer_string} weights")
 
@@ -1318,6 +1448,7 @@ class DnnLayerWeightExperiment():
             
             fig_noise_vs_accuracy.update_traces(mode='lines+markers', opacity=0.8) 
 
+            ## look into why this figure is only saving for the weight normalization experiment!
             df_layer_accuracy_vs_noise = df_accuracy_vs_noise.set_index('noise_vars').T
             print(df_layer_accuracy_vs_noise)
             fig_noise_acc_vs_layer = go.Figure()
@@ -1432,6 +1563,9 @@ def run_dnn_experiments(
             dnn_experiment.all_figures['weight_stds_by_epoch'].write_html(base_file_path_other_figs + "weight_stds_by_epoch.html")
             dnn_experiment.all_figures['accuracies_by_epoch'].write_html(base_file_path_other_figs + "accuracies_by_epoch.html")
             
+            if isinstance(dnn_experiment.model, DiagDNN):
+                dnn_experiment.all_figures['diag_params_by_epoch'].write_html(base_file_path_other_figs + "diag_params_by_epoch.html")
+
             ## store experimental data from training
             # if dnn.normalization_type.upper() == 'WEIGHT':
             #     print("for weight norm, convert models to their state dictionaries")
@@ -1464,8 +1598,9 @@ def run_dnn_experiments(
                     file_path = f"{directory}/{experiment_name}/{k}.html"
                     dnn_experiment.all_figures[k].write_html(file_path)
             dnn_experiment_results[experiment_name] = dnn_experiment
-        
-        dnn_experiment.all_figures['noise_acc_vs_layer'].write_html(f"{directory}/{experiment_name}/noise_acc_vs_layer.html")
+
+            ## this was leading to the figure being saved only once
+            dnn_experiment.all_figures['noise_acc_vs_layer'].write_html(f"{directory}/{experiment_name}/noise_acc_vs_layer.html")
         return dnn_experiment_results
 
 if __name__ == "__main__":
@@ -1475,6 +1610,7 @@ if __name__ == "__main__":
     parser.add_argument("--experiment-type", type=str, help="Train a DNN, load a saved DNN, or load a pretrained CNN", choices=["dnn-train", "dnn-load-model", "cnn"], required=True)
     parser.add_argument("--dataset-name", type=str, help="Select from mnist, fashion_mnist, cifar10", choices=["mnist", "fashion_mnist", "cifar10"], required=True)
     parser.add_argument("--learning-rates-dict", help="Pass a dictionary of learning rates for each dnn experiment", required=False)
+    parser.add_argument("--regularizer", help="Add a regularizer to training", choices=["l2","layer-l2","none"], required=False)
     parser.add_argument("--pretrained-model-name", type=str, help="File name of pretrained DNN/CNN (stored as .pth)", required=False)
     parser.add_argument("--noise-vars", help="Pass a list of non-normalized noise variances that are added to a model", required=False)
     parser.add_argument("--noise-type", help="Pass a noise type or generate figures for all possible types of noise", choices=["input_dim","output_dim","layer_variance","all"], default="all", required=False)
@@ -1489,6 +1625,7 @@ if __name__ == "__main__":
     dataset_name = args.dataset_name
 
     cloud_environment = args.cloud_environment
+    regularizer = args.regularizer
     debug = True if args.debug_mode == "debug" else False
     if debug:
         N_EPOCHS = 20
@@ -1543,10 +1680,16 @@ if __name__ == "__main__":
         else:
             # vBATCH, vLAYER, vWEIGHT all share these!
             if dataset_name.upper() == 'MNIST':
-                dnn2a = DNN(N_CLASSES=10, DATASET_NAME=dataset_name, HIDDEN_LAYER_WIDTHS=[128, 128, 128, 128, 128, 128, 128], random_seed=random_seed, init_type="uniform", normalization_type=normalization_type)
-                dnn2b = DNN(N_CLASSES=10, DATASET_NAME=dataset_name, HIDDEN_LAYER_WIDTHS=[128, 128, 128, 128, 128, 128, 128], random_seed=random_seed, init_type="normal", normalization_type=normalization_type)
-                dnn2c = DNN(N_CLASSES=10, DATASET_NAME=dataset_name, HIDDEN_LAYER_WIDTHS=[256, 224, 196, 172, 150, 128, 100], random_seed=random_seed, init_type="uniform", normalization_type=normalization_type)
-                dnn2d = DNN(N_CLASSES=10, DATASET_NAME=dataset_name, HIDDEN_LAYER_WIDTHS=[256, 224, 196, 172, 150, 128, 100], random_seed=random_seed, init_type="normal", normalization_type=normalization_type)
+                if not add_diagonal_parameter:
+                    dnn2a = DNN(N_CLASSES=10, DATASET_NAME=dataset_name, HIDDEN_LAYER_WIDTHS=[128, 128, 128, 128, 128, 128, 128], random_seed=random_seed, init_type="uniform", normalization_type=normalization_type)
+                    dnn2b = DNN(N_CLASSES=10, DATASET_NAME=dataset_name, HIDDEN_LAYER_WIDTHS=[128, 128, 128, 128, 128, 128, 128], random_seed=random_seed, init_type="normal", normalization_type=normalization_type)
+                    dnn2c = DNN(N_CLASSES=10, DATASET_NAME=dataset_name, HIDDEN_LAYER_WIDTHS=[256, 224, 196, 172, 150, 128, 100], random_seed=random_seed, init_type="uniform", normalization_type=normalization_type)
+                    dnn2d = DNN(N_CLASSES=10, DATASET_NAME=dataset_name, HIDDEN_LAYER_WIDTHS=[256, 224, 196, 172, 150, 128, 100], random_seed=random_seed, init_type="normal", normalization_type=normalization_type)
+                else:
+                    dnn2a = DiagDNN(N_CLASSES=10, DATASET_NAME=dataset_name, HIDDEN_LAYER_WIDTHS=[128, 128, 128, 128, 128, 128, 128], random_seed=random_seed, init_type="uniform", normalization_type=None)
+                    dnn2b = DiagDNN(N_CLASSES=10, DATASET_NAME=dataset_name, HIDDEN_LAYER_WIDTHS=[128, 128, 128, 128, 128, 128, 128], random_seed=random_seed, init_type="normal", normalization_type=None)
+                    dnn2c = DiagDNN(N_CLASSES=10, DATASET_NAME=dataset_name, HIDDEN_LAYER_WIDTHS=[256, 224, 196, 172, 150, 128, 100], random_seed=random_seed, init_type="uniform", normalization_type=None)
+                    dnn2d = DiagDNN(N_CLASSES=10, DATASET_NAME=dataset_name, HIDDEN_LAYER_WIDTHS=[256, 224, 196, 172, 150, 128, 100], random_seed=random_seed, init_type="normal", normalization_type=None)
                 dnn_experiments = {
                     'dnn2a': dnn2a,
                     'dnn2b': dnn2b,
@@ -1554,10 +1697,16 @@ if __name__ == "__main__":
                     'dnn2d': dnn2d,
                 }
             elif dataset_name.upper() == 'CIFAR10':
-                dnn2a = DNN(N_CLASSES=10, DATASET_NAME=dataset_name, HIDDEN_LAYER_WIDTHS=[1024, 1024, 1024, 1024, 1024, 1024, 1024], random_seed=random_seed, init_type="uniform", normalization_type=normalization_type)
-                dnn2b = DNN(N_CLASSES=10, DATASET_NAME=dataset_name, HIDDEN_LAYER_WIDTHS=[1024, 1024, 1024, 1024, 1024, 1024, 1024], random_seed=random_seed, init_type="normal", normalization_type=normalization_type)
-                dnn2c = DNN(N_CLASSES=10, DATASET_NAME=dataset_name, HIDDEN_LAYER_WIDTHS=[1024, 768, 512, 384, 256, 192, 128], random_seed=random_seed, init_type="uniform", normalization_type=normalization_type)
-                dnn2d = DNN(N_CLASSES=10, DATASET_NAME=dataset_name, HIDDEN_LAYER_WIDTHS=[1024, 768, 512, 384, 256, 192, 128], random_seed=random_seed, init_type="normal", normalization_type=normalization_type)
+                if not add_diagonal_parameter:
+                    dnn2a = DNN(N_CLASSES=10, DATASET_NAME=dataset_name, HIDDEN_LAYER_WIDTHS=[1024, 1024, 1024, 1024, 1024, 1024, 1024], random_seed=random_seed, init_type="uniform", normalization_type=normalization_type)
+                    dnn2b = DNN(N_CLASSES=10, DATASET_NAME=dataset_name, HIDDEN_LAYER_WIDTHS=[1024, 1024, 1024, 1024, 1024, 1024, 1024], random_seed=random_seed, init_type="normal", normalization_type=normalization_type)
+                    dnn2c = DNN(N_CLASSES=10, DATASET_NAME=dataset_name, HIDDEN_LAYER_WIDTHS=[1024, 768, 512, 384, 256, 192, 128], random_seed=random_seed, init_type="uniform", normalization_type=normalization_type)
+                    dnn2d = DNN(N_CLASSES=10, DATASET_NAME=dataset_name, HIDDEN_LAYER_WIDTHS=[1024, 768, 512, 384, 256, 192, 128], random_seed=random_seed, init_type="normal", normalization_type=normalization_type)
+                else:
+                    dnn2a = DiagDNN(N_CLASSES=10, DATASET_NAME=dataset_name, HIDDEN_LAYER_WIDTHS=[1024, 1024, 1024, 1024, 1024, 1024, 1024], random_seed=random_seed, init_type="uniform", normalization_type=None)
+                    dnn2b = DiagDNN(N_CLASSES=10, DATASET_NAME=dataset_name, HIDDEN_LAYER_WIDTHS=[1024, 1024, 1024, 1024, 1024, 1024, 1024], random_seed=random_seed, init_type="normal", normalization_type=None)
+                    dnn2c = DiagDNN(N_CLASSES=10, DATASET_NAME=dataset_name, HIDDEN_LAYER_WIDTHS=[1024, 768, 512, 384, 256, 192, 128], random_seed=random_seed, init_type="uniform", normalization_type=None)
+                    dnn2d = DiagDNN(N_CLASSES=10, DATASET_NAME=dataset_name, HIDDEN_LAYER_WIDTHS=[1024, 768, 512, 384, 256, 192, 128], random_seed=random_seed, init_type="normal", normalization_type=None)
                 dnn_experiments = {
                     'dnn2a': dnn2a,
                     'dnn2b': dnn2b,
@@ -1575,7 +1724,7 @@ if __name__ == "__main__":
             dnn_learning_rates_dict=dnn_learning_rates_dict, 
             N_EPOCHS=N_EPOCHS, 
             MAX_TRAIN_ATTEMPTS=5, 
-            regularizer=None, 
+            regularizer=regularizer, 
             debug=debug,
         )
         
@@ -1656,39 +1805,15 @@ if __name__ == "__main__":
     else:
         raise Exception(f"experiment type of {experiment_type} not supported")
     
-    ## pretrained CNN + CIFAR-10
+    ## VGG architecture on CIFAR10
     if experiment_type.upper() == 'CNN':
         start = time.time()
-        print("----- Running CNN experiments with pretrained VGG models -----")
+        print("----- Running CNN experiments with VGG models -----")
 
         if debug:
-            cnn_model = torch.hub.load("chenyaofo/pytorch-cifar-models",f"cifar10_vgg11_bn", pretrained=True).to(device)
-            print(cnn_model)
-            random_seed = 42
-            cnn_experiment = DnnLayerWeightExperiment(model=cnn_model, dataset_name='cifar10', preloaded=True, noise_random_seed=random_seed)
-            cnn_experiment.load_dataset()
-            cnn_experiment.create_layer_weight_plots()
-            cnn_experiment.all_figures['fig_histogram'].write_html(f"{directory}/vgg11_final_layer_weights.html")
-
-            cnn_experiment.create_models_with_noise(N_NOISE_SAMPLES=3)
-            cnn_experiment.create_accuracy_vs_noise_plots()
-
-            file_path = f"{directory}/vgg11_init_noise_experiments.html"
-            cnn_experiment.all_figures['noise_test_accuracies'].write_html(file_path)
+            pass
         else:
-            for vgg_model in ["vgg11","vgg13","vgg16"]:
-                cnn_model = torch.hub.load("chenyaofo/pytorch-cifar-models",f"cifar10_{vgg_model}_bn", pretrained=True).to(device)
-                print(cnn_model)
-                random_seed = 42
-                cnn_experiment = DnnLayerWeightExperiment(model=cnn_model, dataset_name='cifar10', preloaded=True, noise_random_seed=random_seed)
-                cnn_experiment.load_dataset()
-                cnn_experiment.create_layer_weight_plots()
-                cnn_experiment.all_figures['fig_histogram'].write_html(f"{directory}/{vgg_model}_final_layer_weights.html")
-                
-                cnn_experiment.create_models_with_noise(N_NOISE_SAMPLES=500)
-                cnn_experiment.create_accuracy_vs_noise_plots()
-                file_path = f"{directory}/{vgg_model}_init_noise_experiments.html"
-                cnn_experiment.all_figures['noise_test_accuracies'].write_html(file_path)
+            pass
 
         end = time.time()
         runtime = (end - start) / 60
