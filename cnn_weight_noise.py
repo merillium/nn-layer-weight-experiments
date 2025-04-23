@@ -21,6 +21,8 @@ import plotly.graph_objects as go
 import plotly.express as px
 
 from utils import fit_gaussian_curve, init_weights
+from cifar10_models.vgg import vgg11_bn
+from scheduler import WarmupCosineLR
 
 print(torch.__version__)
 print(torch.cuda.is_available())
@@ -175,6 +177,30 @@ class CNN(nn.Module):
                 nn.ReLU(),
                 nn.MaxPool2d(kernel_size=2, stride=2)
             )
+        elif self.normalization_type.upper() == 'WEIGHT':
+            self.conv_layers = nn.Sequential(
+                nn.utils.parametrizations.weight_norm(nn.Conv2d(self._IN_CHANNELS, 64, kernel_size=3, padding=1)),
+                nn.ReLU(),
+                nn.MaxPool2d(kernel_size=2, stride=2),
+                nn.utils.parametrizations.weight_norm(nn.Conv2d(64, 128, kernel_size=3, padding=1)),
+                nn.ReLU(),
+                nn.MaxPool2d(kernel_size=2, stride=2),
+                nn.utils.parametrizations.weight_norm(nn.Conv2d(128, 256, kernel_size=3, padding=1)),
+                nn.ReLU(),
+                nn.utils.parametrizations.weight_norm(nn.Conv2d(256, 256, kernel_size=3, padding=1)),
+                nn.ReLU(),
+                nn.MaxPool2d(kernel_size=2, stride=2),
+                nn.utils.parametrizations.weight_norm(nn.Conv2d(256, 512, kernel_size=3, padding=1)),
+                nn.ReLU(),
+                nn.utils.parametrizations.weight_norm(nn.Conv2d(512, 512, kernel_size=3, padding=1)),
+                nn.ReLU(),
+                nn.MaxPool2d(kernel_size=2, stride=2),
+                nn.utils.parametrizations.weight_norm(nn.Conv2d(512, 512, kernel_size=3, padding=1)),
+                nn.ReLU(),
+                nn.utils.parametrizations.weight_norm(nn.Conv2d(512, 512, kernel_size=3, padding=1)),
+                nn.ReLU(),
+                nn.MaxPool2d(kernel_size=2, stride=2)
+            )
         else:
             raise Exception(f"normalization of type {self.normalization_type} not supported!")
 
@@ -300,6 +326,7 @@ class CnnLayerWeightExperiment():
         self.train_accuracies = []
         self.val_accuracies = []
         self.test_accuracies = []
+        self.learning_rates = []
 
         self.layer_summary_stats = {}
         self.all_layer_noise_test_acc = {
@@ -316,6 +343,7 @@ class CnnLayerWeightExperiment():
             'weight_means_by_epoch': None,
             'weight_stds_by_epoch': None,
             'accuracies_by_epoch': None,
+            'learning_rates_by_epoch': None,
             'noise_acc_vs_layer': None,
         }
     
@@ -377,9 +405,9 @@ class CnnLayerWeightExperiment():
             raise Exception(f"Dataset {self.dataset_name} not supported")
         
         ## create DataLoaders
-        trainloader = DataLoader(self.train_data, batch_size=128, shuffle=True, num_workers=2)
-        valloader = DataLoader(self.val_data, batch_size=128, shuffle=False, pin_memory=True)
-        testloader = DataLoader(self.test_data, batch_size=128, shuffle=True, num_workers=2)
+        trainloader = DataLoader(self.train_data, batch_size=256, shuffle=True, num_workers=2)
+        valloader = DataLoader(self.val_data, batch_size=256, shuffle=False, pin_memory=True)
+        testloader = DataLoader(self.test_data, batch_size=256, shuffle=True, num_workers=2)
         self.dataloaders = {
             'train': trainloader,
             'validation': valloader,
@@ -397,25 +425,34 @@ class CnnLayerWeightExperiment():
         ## OR we can implement it out-of-the-box (this is useful if we intend to modify it)
         ## construct l2_norm one layer at a time for future use
         
-        # l2_lambda = 10**-5
+        l2_lambda = 10**-2
 
         l2_loss = torch.tensor(0.)
         loss_function = nn.CrossEntropyLoss()
 
         ## layer l2, this needs to be changed for CNN
         if regularizer == 'layer-l2':
+            layer_multipliers = []
             layer_multiplier = 1
+            conv_layer_count = 1
             for name, module in self.model.named_modules():
-                if isinstance(module, nn.modules.linear.Linear):
-                    l2_loss = l2_loss + layer_multiplier * torch.linalg.norm(module.weight, 2).detach() ** 2
-                    layer_multiplier *= 0.5
+                if isinstance(module, nn.modules.Conv2d):
+                    if conv_layer_count <= 2:
+                        layer_multiplier = 1
+                    else:
+                        layer_multiplier *= 0.5
+                    l2_loss = l2_loss + layer_multiplier * torch.linalg.norm(torch.flatten(module.weight), 2).pow(2)
+                    layer_multipliers.append(layer_multiplier)
+                    conv_layer_count += 1
+            print(f"layer-l2 regularizer with layer multipliers: {layer_multipliers}")
         elif regularizer == 'l2':
-            layer_multiplier = 1
-            for name, module in self.model.named_modules():
-                if isinstance(module, nn.modules.linear.Linear):
-                    l2_loss = l2_loss + torch.linalg.norm(module.weight, 2).detach() ** 2
+            # layer_multiplier = 1
+            # for name, module in self.model.named_modules():
+            #     if isinstance(module, nn.modules.Conv2d):
+            #         l2_loss = l2_loss + l2_lambda * torch.linalg.norm(torch.flatten(module.weight), 2).pow(2)
+            weight_decay = 1e-2
         elif regularizer == 'none':
-            pass
+            weight_decay = 0
         else:
             raise Exception(f"Regularizer {regularizer} not implemented!")
         
@@ -428,6 +465,7 @@ class CnnLayerWeightExperiment():
 
         train_accuracies = []
         test_accuracies = []
+        learning_rates = []
 
         ## we need to calculate these for each epoch AND each learning rate
         ## otherwise these will not be stored 
@@ -456,11 +494,28 @@ class CnnLayerWeightExperiment():
 
             print(f"Trying learning rate = {lr}")
 
-            optimizer = optim.Adam(self.model.parameters(), lr=lr)
-            ## optimizer = optim.SGD(self.model.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4, nesterov=True)
+            # optimizer = optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
+
+            optimizer = torch.optim.SGD(
+                self.model.parameters(),
+                lr=lr,
+                weight_decay=weight_decay,
+                momentum=0.9,
+                nesterov=True,
+            )
 
             # Set up optimizer with parameter groups
-            scheduler = ReduceLROnPlateau(optimizer, 'min', patience=10, factor=0.2)
+            # scheduler = ReduceLROnPlateau(optimizer, 'min', patience=10, factor=0.2)
+            # total_steps = N_EPOCHS * len(self.dataloaders['train'])
+            # scheduler = {
+            # "scheduler": WarmupCosineLR(
+            #         optimizer, warmup_epochs=total_steps * 0.3, max_epochs=total_steps
+            #     ),
+            #     "interval": "step",
+            #     "name": "learning_rate",
+            # }
+
+            scheduler = WarmupCosineLR(optimizer, warmup_epochs=N_EPOCHS * 0.3, max_epochs=N_EPOCHS)
 
             for epoch in range(N_EPOCHS):
 
@@ -517,13 +572,14 @@ class CnnLayerWeightExperiment():
                 val_loss /= len(self.dataloaders['validation'])
                 print(f"val loss: {val_loss}")
 
-                scheduler.step(val_loss)
+                scheduler.step()
 
                 if np.isnan(train_loss):
                     print(f"Training did not converge for learning rate = {lr}")
                     break
                 
                 current_lr = optimizer.param_groups[0]['lr']
+                learning_rates.append(current_lr)
                 print(f"Epoch {epoch}, lr = {current_lr}: training_loss = {train_loss}, train accuracy = {train_accuracy:.2%}")
                 
                 ## for each epoch, we need to get layer weight std and condition number
@@ -577,10 +633,12 @@ class CnnLayerWeightExperiment():
                     self.train_accuracies = train_accuracies
                     self.test_accuracy = test_accuracy
                     self.test_accuracies = test_accuracies
+                    self.learning_rates = learning_rates
 
             print("--- Resetting model experiment parameters! ---")
             train_accuracies = []
             test_accuracies = []
+            learning_rates = []
             
             if isinstance(self.model, CNN):
                 model_layer_info = {
@@ -824,10 +882,17 @@ class CnnLayerWeightExperiment():
             fig_accuracies.update_layout(title=f"""
                             CNN VGG11: train acc = {final_train_accuracy:.2%}, final test_acc = {final_test_accuracy:.2%}
                             <br>Train and Test Accuracies by Epoch ({self.dataset_name}, normalization_type = {self.normalization_type}, lr = {self.best_lr}, seed = {self.model.random_seed})<br>""")
+            
+            fig_learning_rates = go.Figure()
+            fig_learning_rates.add_trace(go.Scatter(x=list(range(self._N_EPOCHS)), y=self.train_accuracies, name='learning rate'))
+            fig_learning_rates.update_layout(title=f"""
+                            CNN VGG11: train acc = {final_train_accuracy:.2%}, final test_acc = {final_test_accuracy:.2%}
+                            <br>Learning Rate by Epoch ({self.dataset_name}, normalization_type = {self.normalization_type}, lr = {self.best_lr}, seed = {self.model.random_seed})<br>""")
 
             self.all_figures['weight_means_by_epoch'] = fig_weight_means
             self.all_figures['weight_stds_by_epoch'] = fig_weight_stds
             self.all_figures['accuracies_by_epoch'] = fig_accuracies
+            self.all_figures['learning_rates_by_epoch'] = fig_learning_rates
 
         ################################################ 
         # FOR PRELOADED MODEL, ONLY PLOT FINAL WEIGHTS #
@@ -956,7 +1021,6 @@ class CnnLayerWeightExperiment():
             print(n_stack_layers)
         
         ## a preloaded CNN model has a different architecture
-        ## this isn't really used
         else:
             # get standard deviation corresponding to the largest layer
 
@@ -1006,7 +1070,9 @@ class CnnLayerWeightExperiment():
                             true_noise_var =  noise_var / layer_width
                         elif noise_type == "layer_variance":
                             weight_layer_stdev = self.model_layer_info[f"layer_{n+1}"]["weight_std_by_epoch"][-1]
-                            true_noise_var =  weight_layer_stdev**2 * noise_var
+                            true_weight_noise_var =  weight_layer_stdev**2 * noise_var
+                            bias_layer_stdev = np.std(self.model_layer_info[f"layer_{n+1}"]["final_biases"].flatten())
+                            true_bias_noise_var =  bias_layer_stdev**2 * noise_var
                     
                     if self.preloaded:
                         true_noise_var = noise_var
@@ -1032,8 +1098,8 @@ class CnnLayerWeightExperiment():
                             bias_layer_size = self.model.state_dict()[bias_layer_string].data.shape
                             # print(f"size = {size}")
 
-                            weight_noise = torch.normal(mean=0, std=np.sqrt(true_noise_var), size=weight_layer_size).to(device)
-                            bias_noise = torch.normal(mean=0, std=np.sqrt(true_noise_var), size=bias_layer_size).to(device)
+                            weight_noise = torch.normal(mean=0, std=np.sqrt(true_weight_noise_var), size=weight_layer_size).to(device)
+                            bias_noise = torch.normal(mean=0, std=np.sqrt(true_bias_noise_var), size=bias_layer_size).to(device)
 
                             ## add noise to both (bias) and weight layers
                             ## bias_layer_string = f"features.{n_stack}.bias"
@@ -1202,6 +1268,7 @@ def run_cnn_experiments(
             cnn_experiment.all_figures['weight_means_by_epoch'].write_html(base_file_path_other_figs + "weight_means_by_epoch.html")
             cnn_experiment.all_figures['weight_stds_by_epoch'].write_html(base_file_path_other_figs + "weight_stds_by_epoch.html")
             cnn_experiment.all_figures['accuracies_by_epoch'].write_html(base_file_path_other_figs + "accuracies_by_epoch.html")
+            cnn_experiment.all_figures['learning_rates_by_epoch'].write_html(base_file_path_other_figs + "learning_rates_by_epoch.html")
             
             ## store experimental data from training
             if cnn.normalization_type.upper() == 'WEIGHT':
@@ -1267,7 +1334,7 @@ if __name__ == "__main__":
     in_channels = in_channels_map[dataset_name.upper()]
 
     cloud_environment = args.cloud_environment
-    regularizer = args.regularizer
+    regularizer = str(args.regularizer).lower()
     debug = True if args.debug_mode == "debug" else False
     if debug:
         N_EPOCHS = 5
@@ -1276,7 +1343,7 @@ if __name__ == "__main__":
         print(torch.cuda.is_available())
         print(torch.cuda.device_count())
 
-        N_EPOCHS = 50
+        N_EPOCHS = 80
 
     ## if using the cluster, automatically create a new directory, no user input
     if cloud_environment == 'hpc':

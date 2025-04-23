@@ -21,10 +21,11 @@ import plotly.graph_objects as go
 import plotly.express as px
 
 from utils import fit_gaussian_curve, init_weights
+from scheduler import WarmupCosineLR
 
-print(torch.__version__)
-print(torch.cuda.is_available())
-print(torch.cuda.device_count())
+# print(torch.__version__)
+# print(torch.cuda.is_available())
+# print(torch.cuda.device_count())
 device = ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 
 class DNN(nn.Module):
@@ -356,6 +357,7 @@ class DnnLayerWeightExperiment():
         self.train_accuracies = []
         self.val_accuracies = []
         self.test_accuracies = []
+        self.learning_rates = []
 
         self.layer_summary_stats = {}
         self.all_layer_noise_test_acc = {
@@ -379,6 +381,7 @@ class DnnLayerWeightExperiment():
             'accuracies_by_epoch': None,
             # 'noise_test_accuracies': None,
             'noise_acc_vs_layer': None, #
+            'learning_rate': None,
             # 'layer_noise_test_accuracies': None,
         }
     
@@ -466,15 +469,16 @@ class DnnLayerWeightExperiment():
             layer_multiplier = 1
             for name, module in self.model.named_modules():
                 if isinstance(module, nn.modules.linear.Linear):
-                    l2_loss = l2_loss + layer_multiplier * torch.linalg.norm(module.weight, 2).detach() ** 2
+                    l2_loss = l2_loss + layer_multiplier * torch.linalg.norm(module.weight, 2).pow(2)
                     layer_multiplier *= 0.5
         elif regularizer == 'l2':
-            layer_multiplier = 1
-            for name, module in self.model.named_modules():
-                if isinstance(module, nn.modules.linear.Linear):
-                    l2_loss = l2_loss + torch.linalg.norm(module.weight, 2).detach() ** 2
+            # layer_multiplier = 1
+            # for name, module in self.model.named_modules():
+            #     if isinstance(module, nn.modules.linear.Linear):
+            #         l2_loss = l2_loss + torch.linalg.norm(module.weight, 2).pow(2)
+            weight_decay = 1e-3
         elif regularizer is None:
-            pass
+            weight_decay = 0
         else:
             raise Exception(f"Regularizer {regularizer} not implemented!")
         
@@ -487,6 +491,7 @@ class DnnLayerWeightExperiment():
 
         train_accuracies = []
         test_accuracies = []
+        learning_rates = []
 
         ## we need to calculate these for each epoch AND each learning rate
         ## otherwise these will not be stored 
@@ -533,7 +538,15 @@ class DnnLayerWeightExperiment():
             print(f"Trying learning rate = {lr}")
 
             if isinstance(self.model, DNN):
-                optimizer = optim.Adam(self.model.parameters(), lr=lr)
+                # optimizer = optim.Adam(self.model.parameters(), lr=lr)
+                optimizer = torch.optim.SGD(
+                    self.model.parameters(),
+                    lr=lr,
+                    weight_decay=weight_decay,
+                    momentum=0.9,
+                    nesterov=True,
+                )
+                
             elif isinstance(self.model, DiagDNN):
 
                 # Set up optimizer with parameter groups
@@ -547,7 +560,19 @@ class DnnLayerWeightExperiment():
                 ] + [{'params': [diag], 'lr': 1e-2 * lr} for diag in self.model.diag_params])
             
             # Set up optimizer with parameter groups
-            scheduler = ReduceLROnPlateau(optimizer, 'min', patience=10, factor=0.2)
+            # scheduler = ReduceLROnPlateau(optimizer, 'min', patience=10, factor=0.2)
+
+            # total_steps = N_EPOCHS * len(self.dataloaders['train'])
+
+            # scheduler = {
+            # "scheduler": WarmupCosineLR(
+            #         optimizer, warmup_epochs=total_steps * 0.3, max_epochs=total_steps
+            #     ),
+            #     "interval": "step",
+            #     "name": "learning_rate",
+            # }
+
+            scheduler = WarmupCosineLR(optimizer, warmup_epochs=N_EPOCHS * 0.3, max_epochs=N_EPOCHS)
 
             for epoch in range(N_EPOCHS):
 
@@ -619,13 +644,14 @@ class DnnLayerWeightExperiment():
                 val_loss /= len(self.dataloaders['validation'])
                 print(f"val loss: {val_loss}")
 
-                scheduler.step(val_loss)
+                scheduler.step()
 
                 if np.isnan(train_loss):
                     print(f"Training did not converge for learning rate = {lr}")
                     break
                 
                 current_lr = optimizer.param_groups[0]['lr']
+                learning_rates.append(current_lr)
                 print(f"Epoch {epoch}, lr = {current_lr}: training_loss = {train_loss}, train accuracy = {train_accuracy:.2%}")
                 
                 ## for each epoch, we need to get layer weight std and condition number
@@ -698,10 +724,12 @@ class DnnLayerWeightExperiment():
                     self.train_accuracies = train_accuracies
                     self.test_accuracy = test_accuracy
                     self.test_accuracies = test_accuracies
+                    self.learning_rates = learning_rates
 
             print("--- Resetting model experiment parameters! ---")
             train_accuracies = []
             test_accuracies = []
+            learning_rates = []
             
             if isinstance(self.model, DNN):
                 model_layer_info = {
@@ -1168,6 +1196,13 @@ class DnnLayerWeightExperiment():
                             DNN with {self.model._N_LAYERS} layers + layer widths of {self.model._HIDDEN_LAYER_WIDTHS}: train acc = {final_train_accuracy:.2%}, final test_acc = {final_test_accuracy:.2%}
                             <br>Train and Test Accuracies by Epoch ({self.dataset_name}, normalization_type = {self.normalization_type}, lr = {self.best_lr}, seed = {self.model.random_seed})<br>""")
             
+            fig_learning_rates = go.Figure()
+            fig_learning_rates.add_trace(go.Scatter(x=list(range(self._N_EPOCHS)), y=self.learning_rates, name='learning rate'))
+            fig_learning_rates.update_layout(title=f"""
+                            DNN with {self.model._N_LAYERS} layers + layer widths of {self.model._HIDDEN_LAYER_WIDTHS}: train acc = {final_train_accuracy:.2%}, final test_acc = {final_test_accuracy:.2%}
+                            <br>Learning Rates by Epoch ({self.dataset_name}, normalization_type = {self.normalization_type}, lr = {self.best_lr}, seed = {self.model.random_seed})<br>""")
+            
+            self.all_figures['learning_rates_by_epoch'] = fig_learning_rates
             self.all_figures['condition_numbers_by_epoch'] = fig_condition_numbers
             self.all_figures['min_singular_values_by_epoch'] = fig_min_singular_values
             self.all_figures['max_singular_values_by_epoch'] = fig_max_singular_values
@@ -1551,6 +1586,7 @@ def run_dnn_experiments(
             
             ## file path name for epoch based figures
             base_file_path_other_figs = f"{directory}/{experiment_name}/"
+            dnn_experiment.all_figures['learning_rates_by_epoch'].write_html(base_file_path_other_figs + "learning_rates_by_epoch.html")
             dnn_experiment.all_figures['condition_numbers_by_epoch'].write_html(base_file_path_other_figs + "condition_numbers_by_epoch.html")
             dnn_experiment.all_figures['min_singular_values_by_epoch'].write_html(base_file_path_other_figs + "min_singular_values_by_epoch.html")
             dnn_experiment.all_figures['max_singular_values_by_epoch'].write_html(base_file_path_other_figs + "max_singular_values_by_epoch.html")
@@ -1630,11 +1666,11 @@ if __name__ == "__main__":
     if debug:
         N_EPOCHS = 20
     else:
-        print(torch.__version__)
-        print(torch.cuda.is_available())
-        print(torch.cuda.device_count())
+        # print(torch.__version__)
+        # print(torch.cuda.is_available())
+        # print(torch.cuda.device_count())
 
-        N_EPOCHS = 80
+        N_EPOCHS = 100
 
     ## if using the cluster, automatically create a new directory, no user input
     if cloud_environment == 'hpc':

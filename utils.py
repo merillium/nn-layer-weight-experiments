@@ -14,12 +14,12 @@ def fit_gaussian_curve(x_data, y_data, mean, stddev):
 
 def init_weights(m, init_type, random_seed):
     if init_type == 'normal':
-        if isinstance(m, nn.Linear):
+        if isinstance(m, nn.Linear) or isinstance(m, nn.Conv2d):
             torch.cuda.manual_seed(random_seed)
             torch.nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
             # m.bias.data.fill_(0)
     elif init_type == 'uniform':
-        if isinstance(m, nn.Linear):
+        if isinstance(m, nn.Linear) or isinstance(m, nn.Conv2d):
             torch.cuda.manual_seed(random_seed)
             torch.nn.init.kaiming_uniform_(m.weight, a=0, nonlinearity='relu')
             m.bias.data.fill_(0.01)
