@@ -10,7 +10,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.optim.lr_scheduler import ExponentialLR, ReduceLROnPlateau
+from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingWarmRestarts
 from torch.utils.data import DataLoader, random_split
 from torchvision import datasets, transforms
 from torch.nn.utils.parametrize import remove_parametrizations
@@ -504,18 +504,14 @@ class CnnLayerWeightExperiment():
                 nesterov=True,
             )
 
-            # Set up optimizer with parameter groups
-            # scheduler = ReduceLROnPlateau(optimizer, 'min', patience=10, factor=0.2)
-            # total_steps = N_EPOCHS * len(self.dataloaders['train'])
-            # scheduler = {
-            # "scheduler": WarmupCosineLR(
-            #         optimizer, warmup_epochs=total_steps * 0.3, max_epochs=total_steps
-            #     ),
-            #     "interval": "step",
-            #     "name": "learning_rate",
-            # }
-
-            scheduler = WarmupCosineLR(optimizer, warmup_epochs=N_EPOCHS * 0.3, max_epochs=N_EPOCHS)
+            if lr_scheduler.upper() == 'LINEAR':
+                scheduler = ReduceLROnPlateau(optimizer, 'min', patience=10, factor=0.2)
+            elif lr_scheduler.upper() == 'WARMUP':
+                scheduler = WarmupCosineLR(optimizer, warmup_epochs=N_EPOCHS * 0.3, max_epochs=N_EPOCHS)
+            elif lr_scheduler.upper() == 'WARMRESTART':
+                scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=1, T_mult=2)
+            else:
+                raise Exception(f"learning rate scheduler {lr_scheduler} not implemented!")
 
             for epoch in range(N_EPOCHS):
 
@@ -578,7 +574,7 @@ class CnnLayerWeightExperiment():
                     print(f"Training did not converge for learning rate = {lr}")
                     break
                 
-                current_lr = optimizer.param_groups[0]['lr']
+                current_lr = scheduler.get_last_lr()[0]
                 learning_rates.append(current_lr)
                 print(f"Epoch {epoch}, lr = {current_lr}: training_loss = {train_loss}, train accuracy = {train_accuracy:.2%}")
                 
@@ -1315,6 +1311,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset-name", type=str, help="Select from mnist, fashion_mnist, cifar10", choices=["mnist", "fashion_mnist", "cifar10"], required=True)
     parser.add_argument("--learning-rates-dict", help="Pass a dictionary of learning rates for each cnn experiment", required=False)
     parser.add_argument("--regularizer", help="Add a regularizer to training", choices=["l2","layer-l2","none"], required=False)
+    parser.add_argument("--lr-scheduler", help="Decide which learning rate scheduler to use", choices=["Linear","Warmup","WarmRestart"], required=True)
     parser.add_argument("--pretrained-model-name", type=str, help="File name of pretrained cnn/CNN (stored as .pth)", required=False)
     parser.add_argument("--noise-vars", help="Pass a list of non-normalized noise variances that are added to a model", required=False)
     parser.add_argument("--noise-type", help="Pass a noise type or generate figures for all possible types of noise", choices=["input_dim","output_dim","layer_variance","all"], default="all", required=False)
@@ -1360,6 +1357,7 @@ if __name__ == "__main__":
     
     experiment_type = args.experiment_type
     normalization_type = args.normalization_type
+    lr_scheduler = args.lr_scheduler
     if experiment_type.upper() == 'CNN-TRAIN':
 
         ## for debugging, set N_EPOCHS = 10

@@ -10,7 +10,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.optim.lr_scheduler import ExponentialLR, ReduceLROnPlateau
+from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingWarmRestarts
 from torch.utils.data import DataLoader, random_split
 from torchvision import datasets, transforms
 from torch.nn.utils.parametrize import remove_parametrizations
@@ -23,9 +23,9 @@ import plotly.express as px
 from utils import fit_gaussian_curve, init_weights
 from scheduler import WarmupCosineLR
 
-# print(torch.__version__)
-# print(torch.cuda.is_available())
-# print(torch.cuda.device_count())
+print(torch.__version__)
+print(torch.cuda.is_available())
+print(torch.cuda.device_count())
 device = ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 
 class DNN(nn.Module):
@@ -110,7 +110,6 @@ class DNN(nn.Module):
         x = self.linear_relu_stack(x)
         return x
 
-## NEED TO TEST THIS
 class DiagDNN(nn.Module):
     def __init__(self, N_CLASSES, DATASET_NAME, HIDDEN_LAYER_WIDTHS, random_seed, init_type, normalization_type=None):
         super().__init__()
@@ -539,6 +538,7 @@ class DnnLayerWeightExperiment():
 
             if isinstance(self.model, DNN):
                 # optimizer = optim.Adam(self.model.parameters(), lr=lr)
+
                 optimizer = torch.optim.SGD(
                     self.model.parameters(),
                     lr=lr,
@@ -548,31 +548,21 @@ class DnnLayerWeightExperiment():
                 )
                 
             elif isinstance(self.model, DiagDNN):
-
-                # Set up optimizer with parameter groups
-                # optimizer = optim.Adam([
-                #     {'params': self.model.all_layers.parameters(), 'lr': lr},  # Weights
-                #     {'params': self.model.diag_params, 'lr': 1e-2 * lr}  # Diagonal parameters
-                # ])
-
+                
                 optimizer = optim.Adam([
                     {'params': self.model.all_layers.parameters(), 'lr': lr}
                 ] + [{'params': [diag], 'lr': 1e-2 * lr} for diag in self.model.diag_params])
             
             # Set up optimizer with parameter groups
-            # scheduler = ReduceLROnPlateau(optimizer, 'min', patience=10, factor=0.2)
-
-            # total_steps = N_EPOCHS * len(self.dataloaders['train'])
-
-            # scheduler = {
-            # "scheduler": WarmupCosineLR(
-            #         optimizer, warmup_epochs=total_steps * 0.3, max_epochs=total_steps
-            #     ),
-            #     "interval": "step",
-            #     "name": "learning_rate",
-            # }
-
-            scheduler = WarmupCosineLR(optimizer, warmup_epochs=N_EPOCHS * 0.3, max_epochs=N_EPOCHS)
+            
+            if lr_scheduler.upper() == 'LINEAR':
+                scheduler = ReduceLROnPlateau(optimizer, 'min', patience=10, factor=0.2)
+            elif lr_scheduler.upper() == 'WARMUP':
+                scheduler = WarmupCosineLR(optimizer, warmup_epochs=N_EPOCHS * 0.3, max_epochs=N_EPOCHS)
+            elif lr_scheduler.upper() == 'WARMRESTART':
+                scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=1, T_mult=2)
+            else:
+                raise Exception(f"learning rate scheduler {lr_scheduler} not implemented!")
 
             for epoch in range(N_EPOCHS):
 
@@ -650,7 +640,8 @@ class DnnLayerWeightExperiment():
                     print(f"Training did not converge for learning rate = {lr}")
                     break
                 
-                current_lr = optimizer.param_groups[0]['lr']
+                # current_lr = optimizer.param_groups[0]['lr']
+                current_lr = scheduler.get_last_lr()[0]
                 learning_rates.append(current_lr)
                 print(f"Epoch {epoch}, lr = {current_lr}: training_loss = {train_loss}, train accuracy = {train_accuracy:.2%}")
                 
@@ -1442,9 +1433,6 @@ class DnnLayerWeightExperiment():
                     avg_test_acc = test_acc_sum/N_NOISE_SAMPLES
                     layer_avg_test_accs.append(avg_test_acc)
                     print(f"Average test accuracy for {weight_layer_string} with N = {N_NOISE_SAMPLES} samples of noise at vars = {noise_var} using noise type {noise_type}: {avg_test_acc:.2%}")
-            
-                    # layer_number = (2 + int((n_stack-1)/2)) if n_stack != 0 else 1
-                    # print(f'setting layer_{layer_number}')
 
                 self.all_layer_noise_test_acc[noise_type][f'layer_{n+1}'] = np.array(layer_avg_test_accs)
 
@@ -1647,6 +1635,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset-name", type=str, help="Select from mnist, fashion_mnist, cifar10", choices=["mnist", "fashion_mnist", "cifar10"], required=True)
     parser.add_argument("--learning-rates-dict", help="Pass a dictionary of learning rates for each dnn experiment", required=False)
     parser.add_argument("--regularizer", help="Add a regularizer to training", choices=["l2","layer-l2","none"], required=False)
+    parser.add_argument("--lr-scheduler", help="Decide which learning rate scheduler to use", choices=["Linear","Warmup","WarmRestart"], required=True)
     parser.add_argument("--pretrained-model-name", type=str, help="File name of pretrained DNN/CNN (stored as .pth)", required=False)
     parser.add_argument("--noise-vars", help="Pass a list of non-normalized noise variances that are added to a model", required=False)
     parser.add_argument("--noise-type", help="Pass a noise type or generate figures for all possible types of noise", choices=["input_dim","output_dim","layer_variance","all"], default="all", required=False)
@@ -1688,6 +1677,7 @@ if __name__ == "__main__":
     experiment_type = args.experiment_type
     add_diagonal_parameter = True if str(args.add_diagonal_parameter).upper() == 'TRUE' else False
     normalization_type = args.normalization_type
+    lr_scheduler = args.lr_scheduler
     if experiment_type.upper() == 'DNN-TRAIN':
 
         ## for debugging, set N_EPOCHS = 10
